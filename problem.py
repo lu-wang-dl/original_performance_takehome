@@ -145,7 +145,7 @@ class Machine:
 
     def rewrite_slot(self, slot):
         return tuple(
-            self.debug_info.scratch_map.get(s, (None, None))[0] or s for s in slot
+            (self.debug_info.scratch_map.get(s, (None, None))[0] if isinstance(s, (int, str)) and s in self.debug_info.scratch_map else s) for s in slot
         )
 
     def setup_trace(self):
