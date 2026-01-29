@@ -36,7 +36,6 @@ from problem import (
     reference_kernel2,
 )
 
-
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
@@ -45,6 +44,7 @@ class KernelBuilder:
         self.scratch_ptr = 0
         self.const_map = {}
         self.vconst_map = {}
+        self.enable_debug = True
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -90,7 +90,8 @@ class KernelBuilder:
             slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
             slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
             slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+            if self.enable_debug:
+                slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
 
         return slots
 
@@ -106,7 +107,8 @@ class KernelBuilder:
                 slots.append(("valu", (op1, tmp1, val_hash_addr, self.scratch_vconst(val1))))
                 slots.append(("valu", (op3, tmp2, val_hash_addr, self.scratch_vconst(val3))))
                 slots.append(("valu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("vcompare", val_hash_addr, [(round, i+idx, "hash_stage", hi) for idx in range(VLEN)])))
+            if self.enable_debug:
+                slots.append(("debug", ("vcompare", val_hash_addr, [(round, i+idx, "hash_stage", hi) for idx in range(VLEN)])))
         
         return slots
 
@@ -173,8 +175,8 @@ class KernelBuilder:
         # file requires these match up to the reference kernel's yields, but the
         # submission harness ignores them.
         self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+        if self.enable_debug:
+            self.add("debug", ("comment", "Starting loop"))
 
         body = []  # array of slots
 
@@ -187,31 +189,36 @@ class KernelBuilder:
         for round in range(rounds):
             for i in range(0, batch_size, VLEN):
                 # idx = mem[inp_indices_p + i]
-                idx_ptr = idx_ptrs + i
-                body.append(("load", ("vload", vtmp_idx, idx_ptr)))
-                body.append(("debug", ("vcompare", vtmp_idx, [(round, i+j, "idx") for j in range(VLEN)])))
                 # val = mem[inp_values_p + i]
+                idx_ptr = idx_ptrs + i
                 val_ptr = val_ptrs + i
+                body.append(("load", ("vload", vtmp_idx, idx_ptr)))                
                 body.append(("load", ("vload", vtmp_val, val_ptr)))
-                body.append(("debug", ("vcompare", vtmp_val, [(round, i+j, "val") for j in range(VLEN)])))
+                if self.enable_debug:
+                    body.append(("debug", ("vcompare", vtmp_idx, [(round, i+j, "idx") for j in range(VLEN)])))
+                    body.append(("debug", ("vcompare", vtmp_val, [(round, i+j, "val") for j in range(VLEN)])))
                 # node_val = mem[forest_values_p + idx]
                 body.append(("valu", ("+", vtmp_addr, v_forest_p, vtmp_idx)))
                 for j in range(VLEN):
                     body.append(("load", ("load_offset", vtmp_node_val, vtmp_addr, j)))
-                body.append(("debug", ("vcompare", vtmp_node_val, [(round, i+j, "node_val") for j in range(VLEN)])))
+                if self.enable_debug:
+                    body.append(("debug", ("vcompare", vtmp_node_val, [(round, i+j, "node_val") for j in range(VLEN)])))
                 # val = myhash(val ^ node_val)
                 body.append(("valu", ("^", vtmp_val, vtmp_val, vtmp_node_val)))
                 body.extend(self.build_vhash(vtmp_val, vtmp1, vtmp2, round, i))
-                body.append(("debug", ("vcompare", vtmp_val, [(round, i+j, "hashed_val") for j in range(VLEN)])))
+                if self.enable_debug:
+                    body.append(("debug", ("vcompare", vtmp_val, [(round, i+j, "hashed_val") for j in range(VLEN)])))
                 # Change to idx = 2*idx + 1 + (val % 2)
                 body.append(("valu", ("&", vtmp3, vtmp_val, vone_const)))
                 body.append(("valu", ("+", vtmp3, vtmp3, vone_const)))
                 body.append(("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, vtmp3)))
-                body.append(("debug", ("vcompare", vtmp_idx, [(round, i+j, "next_idx") for j in range(VLEN)])))
+                if self.enable_debug:
+                    body.append(("debug", ("vcompare", vtmp_idx, [(round, i+j, "next_idx") for j in range(VLEN)])))
                 # Change to idx = idx * (idx < n_nodes)
                 body.append(("valu", ("<", vtmp1, vtmp_idx, v_n_nodes)))
                 body.append(("valu", ("*", vtmp_idx, vtmp1, vtmp_idx)))
-                body.append(("debug", ("vcompare", vtmp_idx, [(round, i+j, "wrapped_idx") for j in range(VLEN)])))
+                if self.enable_debug:
+                    body.append(("debug", ("vcompare", vtmp_idx, [(round, i+j, "wrapped_idx") for j in range(VLEN)])))
                 # mem[inp_indices_p + i] = idx
                 body.append(("store", ("vstore", idx_ptr, vtmp_idx)))
                 # mem[inp_values_p + i] = val
