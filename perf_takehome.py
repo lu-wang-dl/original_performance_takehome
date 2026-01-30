@@ -37,7 +37,7 @@ from problem import (
 )
 
 class KernelBuilder:
-    LOOK_AHEAD_NUMBER = 100
+    LOOK_AHEAD_NUMBER = 200
     NUM_PARALLEL_BLOCKS = 8
 
     def __init__(self):
@@ -217,36 +217,40 @@ class KernelBuilder:
                 idx += 1
 
             # Look ahead: Add slots that do not conflict with the current bundle
+            # Use a more aggressive multi-pass approach to find independent operations
             skipped_outputs = set()
-            for look_ahead in range(idx, min(n, idx+self.LOOK_AHEAD_NUMBER)):
-                if used[look_ahead]:
-                    log_decision(f"  Lookahead {look_ahead}: already used, skipping.")
-                    continue
-                look_ahead_engine, look_ahead_slot = slots[look_ahead]
-                look_ahead_inputs, look_ahead_outputs, look_ahead_barrier = self._slot_input_output(look_ahead_engine, look_ahead_slot)
-                log_decision(f"  Lookahead {look_ahead}: engine={look_ahead_engine}, slot={look_ahead_slot}")
-                if look_ahead_barrier:
-                    log_decision(f"  Lookahead {look_ahead}: barrier encountered, breaking lookahead.")
-                    break
-                # RAW: Can't add if slot reads from a skipped slot's output
-                if look_ahead_inputs & skipped_outputs:
-                    log_decision(f"  Lookahead {look_ahead}: RAW hazard (inputs {look_ahead_inputs} & skipped_outputs {skipped_outputs}), skipping.")
-                    skipped_outputs.update(look_ahead_outputs)
-                    continue
-                # WAW: Can't add if slot writes to a skipped slot's output
-                if look_ahead_outputs & skipped_outputs:
-                    log_decision(f"  Lookahead {look_ahead}: WAW hazard (outputs {look_ahead_outputs} & skipped_outputs {skipped_outputs}), skipping.")
-                    skipped_outputs.update(look_ahead_outputs)
-                    continue
-                if can_add_to_bundle(look_ahead_engine, look_ahead_inputs, look_ahead_outputs):
-                    log_decision(f"  Lookahead {look_ahead}: can add to bundle: engine={look_ahead_engine}, slot={look_ahead_slot}.")
-                    bundle.setdefault(look_ahead_engine, []).append(look_ahead_slot)
-                    bundle_input.update(look_ahead_inputs)
-                    bundle_output.update(look_ahead_outputs)
-                    used[look_ahead] = True
-                else:
-                    log_decision(f"  Lookahead {look_ahead}: cannot add to bundle, updating skipped_outputs (outputs {look_ahead_outputs}).")
-                    skipped_outputs.update(look_ahead_outputs)
+            made_progress = True
+            while made_progress:
+                made_progress = False
+                for look_ahead in range(idx, min(n, idx+self.LOOK_AHEAD_NUMBER)):
+                    if used[look_ahead]:
+                        continue
+                    look_ahead_engine, look_ahead_slot = slots[look_ahead]
+                    look_ahead_inputs, look_ahead_outputs, look_ahead_barrier = self._slot_input_output(look_ahead_engine, look_ahead_slot)
+                    log_decision(f"  Lookahead {look_ahead}: engine={look_ahead_engine}, slot={look_ahead_slot}")
+                    if look_ahead_barrier:
+                        log_decision(f"  Lookahead {look_ahead}: barrier encountered, breaking lookahead.")
+                        break
+                    # RAW: Can't add if slot reads from a skipped slot's output
+                    if look_ahead_inputs & skipped_outputs:
+                        log_decision(f"  Lookahead {look_ahead}: RAW hazard (inputs {look_ahead_inputs} & skipped_outputs {skipped_outputs}), skipping.")
+                        skipped_outputs.update(look_ahead_outputs)
+                        continue
+                    # WAW: Can't add if slot writes to a skipped slot's output
+                    if look_ahead_outputs & skipped_outputs:
+                        log_decision(f"  Lookahead {look_ahead}: WAW hazard (outputs {look_ahead_outputs} & skipped_outputs {skipped_outputs}), skipping.")
+                        skipped_outputs.update(look_ahead_outputs)
+                        continue
+                    if can_add_to_bundle(look_ahead_engine, look_ahead_inputs, look_ahead_outputs):
+                        log_decision(f"  Lookahead {look_ahead}: can add to bundle: engine={look_ahead_engine}, slot={look_ahead_slot}.")
+                        bundle.setdefault(look_ahead_engine, []).append(look_ahead_slot)
+                        bundle_input.update(look_ahead_inputs)
+                        bundle_output.update(look_ahead_outputs)
+                        used[look_ahead] = True
+                        made_progress = True
+                    else:
+                        log_decision(f"  Lookahead {look_ahead}: cannot add to bundle, updating skipped_outputs (outputs {look_ahead_outputs}).")
+                        skipped_outputs.update(look_ahead_outputs)
 
         flush_bundle()
         log_decision("Build finished\n")
@@ -264,18 +268,24 @@ class KernelBuilder:
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
-    def scratch_const(self, val, name=None):
+    def scratch_const(self, val, name=None, init_slots=None):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
+            if init_slots is not None:
+                init_slots.append(("load", ("const", addr, val)))
+            else:
+                self.add("load", ("const", addr, val))
             self.const_map[val] = addr
         return self.const_map[val]
     
-    def scratch_vconst(self, val, name=None):
+    def scratch_vconst(self, val, name=None, init_slots=None):
         if val not in self.vconst_map:
             addr = self.alloc_scratch(name, length=VLEN)
-            scalar_addr = self.scratch_const(val)
-            self.add("valu", ("vbroadcast", addr, scalar_addr))
+            scalar_addr = self.scratch_const(val, init_slots=init_slots)
+            if init_slots is not None:
+                init_slots.append(("valu", ("vbroadcast", addr, scalar_addr)))
+            else:
+                self.add("valu", ("vbroadcast", addr, scalar_addr))
             self.vconst_map[val] = addr
         return self.vconst_map[val]
 
@@ -326,10 +336,6 @@ class KernelBuilder:
         By interleaving iterations at different pipeline stages, we overlap
         the load bottleneck with computation.
         """
-
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-
         # Scratch space addresses
         init_vars = [
             "rounds",
@@ -357,17 +363,22 @@ class KernelBuilder:
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
 
         n_chunks = batch_size // VLEN
-        
-        # Pre-allocate offset constants and address registers for parallel loading
-        offset_consts = [self.scratch_const(i * VLEN) for i in range(n_chunks)]
         idx_addrs = [self.alloc_scratch(f"idx_addr_{i}") for i in range(n_chunks)]
         val_addrs = [self.alloc_scratch(f"val_addr_{i}") for i in range(n_chunks)]
-
-        vone_const = self.scratch_vconst(1, "vone")
-        vtwo_const = self.scratch_vconst(2, "vtwo")
-
+        # Pre-allocate store address registers for parallel storing
+        idx_store_addrs = [self.alloc_scratch(f"idx_store_addr_{i}") for i in range(n_chunks)]
+        val_store_addrs = [self.alloc_scratch(f"val_store_addr_{i}") for i in range(n_chunks)]
+        
         # Collect init slots and build them together for bundling
         init_slots = []
+
+        zero_const = self.scratch_const(0, init_slots=init_slots)
+        one_const = self.scratch_const(1, init_slots=init_slots)
+        # Pre-allocate offset constants and address registers for parallel loading
+        offset_consts = [self.scratch_const(i * VLEN, init_slots=init_slots) for i in range(n_chunks)]
+        
+        vone_const = self.scratch_vconst(1, "vone", init_slots=init_slots)
+        vtwo_const = self.scratch_vconst(2, "vtwo", init_slots=init_slots)
         
         # Load header first
         init_slots.append(("load", ("vload", header_base, zero_const)))
@@ -387,20 +398,20 @@ class KernelBuilder:
         init_slots.append(("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])))
         init_slots.append(("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"])))
 
-        # Build and add init instructions
-        init_instrs = self.build(init_slots)
-        self.instrs.extend(init_instrs)
-
         # Pre-allocate hash stage constants
         for stage_idx in range(len(HASH_STAGES)):
             op1, val1, op2, op3, val3 = HASH_STAGES[stage_idx]
             if op1 == "+" and op2 == "+" and op3 == "<<":
                 factor = 1 + (1 << val3)
-                self.scratch_vconst(factor)
-                self.scratch_vconst(val1)
+                self.scratch_vconst(factor, init_slots=init_slots)
+                self.scratch_vconst(val1, init_slots=init_slots)
             else:
-                self.scratch_vconst(val1)
-                self.scratch_vconst(val3)
+                self.scratch_vconst(val1, init_slots=init_slots)
+                self.scratch_vconst(val3, init_slots=init_slots)
+
+        # Build and add init instructions
+        init_instrs = self.build(init_slots)
+        self.instrs.extend(init_instrs)
 
         scratch_blocks = []
         for i in range(self.NUM_PARALLEL_BLOCKS):
@@ -435,15 +446,13 @@ class KernelBuilder:
             return scratch_blocks[iter_idx % self.NUM_PARALLEL_BLOCKS]
         
         def emit_stage0_load_idx_val(iter_idx):
-            """Stage 0: Load idx and val vectors from memory."""
+            """Stage 0: Load idx and val vectors from cached values."""
             params = get_iter_params(iter_idx)
             if params is None:
                 return []
             round_num, i = params
             slots = []
 
-            # idx = mem[inp_indices_p + i]
-            # val = mem[inp_values_p + i]
             vtmp_idx = idx_cache + i    
             vtmp_val = val_cache + i
             if self.enable_debug:
@@ -573,19 +582,16 @@ class KernelBuilder:
             if 0 <= iter_s1 < n_iters:
                 body.extend(emit_stage1_loads_node_val(iter_s1))
             
-        idx_store_ptr = self.alloc_scratch("idx_store_ptr")
-        val_store_ptr = self.alloc_scratch("val_store_ptr")
-        body.append(
-            ("alu", ("+", idx_store_ptr, self.scratch["inp_indices_p"], zero_const))
-        )
-        body.append(
-            ("alu", ("+", val_store_ptr, self.scratch["inp_values_p"], zero_const))
-        )
-        for i in range(0, batch_size, VLEN):
-            body.append(("store", ("vstore", idx_store_ptr, idx_cache + i)))
-            body.append(("store", ("vstore", val_store_ptr, val_cache + i)))
-            body.append(("flow", ("add_imm", idx_store_ptr, idx_store_ptr, VLEN)))
-            body.append(("flow", ("add_imm", val_store_ptr, val_store_ptr, VLEN)))
+        # Pre-compute all store addresses using ALU (12 slots/cycle) - allows bundling
+        # Reuse offset_consts that were already computed in init
+        for j in range(n_chunks):
+            body.append(("alu", ("+", idx_store_addrs[j], self.scratch["inp_indices_p"], offset_consts[j])))
+            body.append(("alu", ("+", val_store_addrs[j], self.scratch["inp_values_p"], offset_consts[j])))
+        
+        # Issue all stores in parallel (2 per cycle) - no dependencies between iterations
+        for j in range(n_chunks):
+            body.append(("store", ("vstore", idx_store_addrs[j], idx_cache + j * VLEN)))
+            body.append(("store", ("vstore", val_store_addrs[j], val_cache + j * VLEN)))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
@@ -634,8 +640,8 @@ def do_kernel_test(
             print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
             print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
         assert (
-            machine.mem[inp_values_p : inp_values_p + len(inp.values)]
-            == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
+           machine.mem[inp_values_p : inp_values_p + len(inp.values)]
+           == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
         ), f"Incorrect result on round {i}"
         inp_indices_p = ref_mem[5]
         if prints:
