@@ -37,9 +37,8 @@ from problem import (
 )
 
 class KernelBuilder:
-
     LOOK_AHEAD_NUMBER = 100
-    NUM_PARALLEL_BLOCKS = 16
+    NUM_PARALLEL_BLOCKS = 8
 
     def __init__(self):
         self.instrs = []
