@@ -37,7 +37,6 @@ from problem import (
 )
 
 class KernelBuilder:
-
     LOOK_AHEAD_NUMBER = 100
     NUM_PARALLEL_BLOCKS = 8
 
@@ -345,33 +344,67 @@ class KernelBuilder:
             self.alloc_scratch(v)
 
         header_base = self.alloc_scratch("header", VLEN)
-        self.add("load", ("vload", header_base, zero_const))
         # Map init_vars to their positions in the header block
         for i, v in enumerate(init_vars):
             self.scratch[v] = header_base + i
-            self.scratch_debug[header_base + i] = (v, 1)
+            self.scratch_debug[header_base + i] = (v, 1) 
+        
+        # Pre-allocate idx and val
+        idx_cache = self.alloc_scratch("idx_cache", batch_size)
+        val_cache = self.alloc_scratch("val_cache", batch_size)
 
-        # Precompute the idx: inp_indices_p + i and inp_values_p + i
-        idx_ptrs = self.alloc_scratch("idx_ptrs", batch_size)
-        val_ptrs = self.alloc_scratch("val_ptrs", batch_size)
-        self.add("alu", ("+", idx_ptrs, self.scratch["inp_indices_p"], zero_const))
-        self.add("alu", ("+", val_ptrs, self.scratch["inp_values_p"], zero_const))
-        for i in range(1, batch_size):
-            self.add("alu", ("+", idx_ptrs + i, idx_ptrs + i - 1, one_const))
-            self.add("alu", ("+", val_ptrs + i, val_ptrs + i - 1, one_const))   
+        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
+        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
+
+        n_chunks = batch_size // VLEN
+        
+        # Pre-allocate offset constants and address registers for parallel loading
+        offset_consts = [self.scratch_const(i * VLEN) for i in range(n_chunks)]
+        idx_addrs = [self.alloc_scratch(f"idx_addr_{i}") for i in range(n_chunks)]
+        val_addrs = [self.alloc_scratch(f"val_addr_{i}") for i in range(n_chunks)]
 
         vone_const = self.scratch_vconst(1, "vone")
         vtwo_const = self.scratch_vconst(2, "vtwo")
-        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
-        self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
-        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
-        self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
+
+        # Collect init slots and build them together for bundling
+        init_slots = []
+        
+        # Load header first
+        init_slots.append(("load", ("vload", header_base, zero_const)))
+        
+        # Compute all addresses using ALU (12 slots/cycle) - removes flow bottleneck
+        # These can all be bundled together after header loads
+        for j in range(n_chunks):
+            init_slots.append(("alu", ("+", idx_addrs[j], self.scratch["inp_indices_p"], offset_consts[j])))
+            init_slots.append(("alu", ("+", val_addrs[j], self.scratch["inp_values_p"], offset_consts[j])))
+        
+        # Issue all loads (2 per cycle) - no dependencies between iterations now
+        for j in range(n_chunks):
+            init_slots.append(("load", ("vload", idx_cache + j * VLEN, idx_addrs[j])))
+            init_slots.append(("load", ("vload", val_cache + j * VLEN, val_addrs[j])))
+        
+        # Broadcasts can happen in parallel with loads (uses valu engine)
+        init_slots.append(("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])))
+        init_slots.append(("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"])))
+
+        # Build and add init instructions
+        init_instrs = self.build(init_slots)
+        self.instrs.extend(init_instrs)
+
+        # Pre-allocate hash stage constants
+        for stage_idx in range(len(HASH_STAGES)):
+            op1, val1, op2, op3, val3 = HASH_STAGES[stage_idx]
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                factor = 1 + (1 << val3)
+                self.scratch_vconst(factor)
+                self.scratch_vconst(val1)
+            else:
+                self.scratch_vconst(val1)
+                self.scratch_vconst(val3)
 
         scratch_blocks = []
         for i in range(self.NUM_PARALLEL_BLOCKS):
             scratch_blocks.append({
-                "idx": self.alloc_scratch(f"block_{i}_idx", VLEN),
-                "val": self.alloc_scratch(f"block_{i}_val", VLEN),
                 "node_val": self.alloc_scratch(f"block_{i}_node_val", VLEN),
                 "addr": self.alloc_scratch(f"block_{i}_addr", VLEN),
                 "vtmp1": self.alloc_scratch(f"block_{i}_vtmp1", VLEN),
@@ -407,18 +440,12 @@ class KernelBuilder:
             if params is None:
                 return []
             round_num, i = params
-            block = get_block(iter_idx)
-            vtmp_idx = block["idx"]
-            vtmp_val = block["val"]
-
             slots = []
 
             # idx = mem[inp_indices_p + i]
             # val = mem[inp_values_p + i]
-            idx_ptr = idx_ptrs + i
-            val_ptr = val_ptrs + i
-            slots.append(("load", ("vload", vtmp_idx, idx_ptr)))
-            slots.append(("load", ("vload", vtmp_val, val_ptr)))
+            vtmp_idx = idx_cache + i    
+            vtmp_val = val_cache + i
             if self.enable_debug:
                 slots.append(("debug", ("vcompare", vtmp_idx, [(round_num, i+j, "idx") for j in range(VLEN)])))
                 slots.append(("debug", ("vcompare", vtmp_val, [(round_num, i+j, "val") for j in range(VLEN)])))
@@ -431,7 +458,7 @@ class KernelBuilder:
                 return []
             round_num, i = params
             block = get_block(iter_idx)
-            vtmp_idx = block["idx"]
+            vtmp_idx = idx_cache + i  # Use idx_cache directly
             vtmp_addr = block["addr"]
             vtmp_node_val = block["node_val"]
             
@@ -452,8 +479,9 @@ class KernelBuilder:
             params = get_iter_params(iter_idx)
             if params is None:
                 return []
+            round_num, i = params
             block = get_block(iter_idx)
-            vtmp_val = block["val"]
+            vtmp_val = val_cache + i  # Use val_cache directly
             vtmp_node_val = block["node_val"]
             
             slots = []
@@ -468,20 +496,21 @@ class KernelBuilder:
                 return []
             round_num, i = params
             block = get_block(iter_idx)
+            vtmp_val = val_cache + i  # Use val_cache directly
             slots = []
             # # val = myhash(val)
             for hi in range(6):
                 op1, val1, op2, op3, val3 = HASH_STAGES[hi]
                 if op1 == "+" and op2 == "+" and op3 == "<<":
                     factor = 1 + (1 << val3)
-                    slots.append(("valu", ("multiply_add", block["val"], block["val"], 
+                    slots.append(("valu", ("multiply_add", vtmp_val, vtmp_val, 
                                           self.scratch_vconst(factor), self.scratch_vconst(val1))))
                 else:
-                    slots.append(("valu", (op1, block["vtmp1"], block["val"], self.scratch_vconst(val1))))
-                    slots.append(("valu", (op3, block["vtmp2"], block["val"], self.scratch_vconst(val3))))
-                    slots.append(("valu", (op2, block["val"], block["vtmp1"], block["vtmp2"])))
+                    slots.append(("valu", (op1, block["vtmp1"], vtmp_val, self.scratch_vconst(val1))))
+                    slots.append(("valu", (op3, block["vtmp2"], vtmp_val, self.scratch_vconst(val3))))
+                    slots.append(("valu", (op2, vtmp_val, block["vtmp1"], block["vtmp2"])))
             if self.enable_debug:
-                slots.append(("debug", ("vcompare", block["val"], [(round_num, i+j, "hashed_val") for j in range(VLEN)])))
+                slots.append(("debug", ("vcompare", vtmp_val, [(round_num, i+j, "hashed_val") for j in range(VLEN)])))
             return slots
         
         def emit_idx_update(iter_idx):
@@ -491,40 +520,26 @@ class KernelBuilder:
                 return []
             round_num, i = params
             block = get_block(iter_idx)
+            vtmp_idx = idx_cache + i  # Use idx_cache directly
+            vtmp_val = val_cache + i  # Use val_cache directly
             slots = []
             # idx = 2*idx + 1 + (val & 1)
-            slots.append(("valu", ("&", block["vtmp3"], block["val"], vone_const)))
+            slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
             slots.append(("valu", ("+", block["vtmp3"], block["vtmp3"], vone_const)))
-            slots.append(("valu", ("multiply_add", block["idx"], block["idx"], vtwo_const, block["vtmp3"])))
+            slots.append(("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, block["vtmp3"])))
             if self.enable_debug:
-                slots.append(("debug", ("vcompare", block["idx"], [(round_num, i+j, "next_idx") for j in range(VLEN)])))
+                slots.append(("debug", ("vcompare", vtmp_idx, [(round_num, i+j, "next_idx") for j in range(VLEN)])))
             # idx = 0 if idx >= n_nodes else idx
             # idx = idx * (idx < n_nodes)
-            slots.append(("valu", ("<", block["vtmp1"], block["idx"], v_n_nodes)))
-            slots.append(("valu", ("*", block["idx"], block["vtmp1"], block["idx"])))
+            slots.append(("valu", ("<", block["vtmp1"], vtmp_idx, v_n_nodes)))
+            slots.append(("valu", ("*", vtmp_idx, block["vtmp1"], vtmp_idx)))
             if self.enable_debug:
-                slots.append(("debug", ("vcompare", block["idx"], [(round_num, i+j, "wrapped_idx") for j in range(VLEN)])))
-            return slots
-        
-        def emit_stores(iter_idx):
-            """Store operations."""
-            params = get_iter_params(iter_idx)
-            if params is None:
-                return []
-            round_num, i = params
-            block = get_block(iter_idx)
-            idx_ptr = idx_ptrs + i
-            val_ptr = val_ptrs + i
-            slots = []
-            # mem[inp_indices_p + i] = idx
-            # mem[inp_values_p + i] = val
-            slots.append(("store", ("vstore", idx_ptr, block["idx"])))
-            slots.append(("store", ("vstore", val_ptr, block["val"])))
+                slots.append(("debug", ("vcompare", vtmp_idx, [(round_num, i+j, "wrapped_idx") for j in range(VLEN)])))
             return slots
         
         # Software pipelined execution with 6 stages (global across all rounds)
         n_iters = rounds * (batch_size // VLEN)
-        NUM_STAGES = 6
+        NUM_STAGES = 5
         total_steps = n_iters + NUM_STAGES - 1
         
         for step in range(total_steps):
@@ -558,10 +573,19 @@ class KernelBuilder:
             if 0 <= iter_s1 < n_iters:
                 body.extend(emit_stage1_loads_node_val(iter_s1))
             
-            # Stage 5: Stores (store operations - 2 slots available)
-            iter_s5 = step - 5
-            if 0 <= iter_s5 < n_iters:
-                body.extend(emit_stores(iter_s5))
+        idx_store_ptr = self.alloc_scratch("idx_store_ptr")
+        val_store_ptr = self.alloc_scratch("val_store_ptr")
+        body.append(
+            ("alu", ("+", idx_store_ptr, self.scratch["inp_indices_p"], zero_const))
+        )
+        body.append(
+            ("alu", ("+", val_store_ptr, self.scratch["inp_values_p"], zero_const))
+        )
+        for i in range(0, batch_size, VLEN):
+            body.append(("store", ("vstore", idx_store_ptr, idx_cache + i)))
+            body.append(("store", ("vstore", val_store_ptr, val_cache + i)))
+            body.append(("flow", ("add_imm", idx_store_ptr, idx_store_ptr, VLEN)))
+            body.append(("flow", ("add_imm", val_store_ptr, val_store_ptr, VLEN)))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
@@ -655,7 +679,7 @@ class Tests(unittest.TestCase):
     #             )
 
     def test_kernel_cycles(self):
-        do_kernel_test(10, 1, 16)
+        do_kernel_test(10, 16, 256)
 
 
 # To run all the tests:
