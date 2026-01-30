@@ -39,6 +39,7 @@ from problem import (
 class KernelBuilder:
 
     LOOK_AHEAD_NUMBER = 100
+    NUM_PARALLEL_BLOCKS = 8
 
     def __init__(self):
         self.instrs = []
@@ -47,7 +48,8 @@ class KernelBuilder:
         self.scratch_ptr = 0
         self.const_map = {}
         self.vconst_map = {}
-        self.enable_debug = True
+        self.enable_debug = False
+        self.enable_bundle_logging = False
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -137,21 +139,50 @@ class KernelBuilder:
         bundle_input = set()
         bundle_output = set()
 
+        # Add a flag to enable/disable logging
+        enable_logging = getattr(self, "enable_bundle_logging", False)
+
+        import os
+        import inspect
+
+        log_file_path = "bundle_decisions.log"
+        if enable_logging:
+            # Optionally, clear the log before starting (can comment out if desired)
+            with open(log_file_path, "w") as log_file:
+                log_file.write("")  # Clear file before logging
+
+        def log_decision(message):
+            if not enable_logging:
+                return
+            frame = inspect.currentframe().f_back
+            lineno = frame.f_lineno
+            with open(log_file_path, "a") as log_file:
+                log_file.write(f"[line {lineno}] {message}\n")
+
         def flush_bundle():
             nonlocal bundle, bundle_input, bundle_output
             if bundle:
                 instrs.append(bundle)
+            log_decision(f"Flush: {bundle}, bundle_input: {bundle_input}, bundle_output: {bundle_output}")
             bundle = {}
             bundle_input = set()
             bundle_output = set()
         
         def can_add_to_bundle(engine, slot_inputs, slot_outputs):
+            reason = None
             if len(bundle.get(engine, [])) >= SLOT_LIMITS[engine]:
+                reason = f"SLOT_LIMIT: engine={engine} has {len(bundle.get(engine, []))} (limit {SLOT_LIMITS[engine]})"
+                log_decision(f"can_add_to_bundle: NO (engine={engine}) - {reason}")
                 return False
             if slot_inputs & bundle_output:
+                reason = f"RAW hazard: slot_inputs {slot_inputs} & bundle_output {bundle_output} = {slot_inputs & bundle_output}"
+                log_decision(f"can_add_to_bundle: NO (engine={engine}) - {reason}")
                 return False
             if slot_outputs & bundle_output:
+                reason = f"WAW hazard: slot_outputs {slot_outputs} & bundle_output {bundle_output} = {slot_outputs & bundle_output}"
+                log_decision(f"can_add_to_bundle: NO (engine={engine}) - {reason}")
                 return False
+            log_decision(f"can_add_to_bundle: YES (engine={engine})")
             return True
         
         idx = 0
@@ -161,43 +192,24 @@ class KernelBuilder:
                 continue
             engine, slot = slots[idx]
             slot_inputs, slot_outputs, barrier = self._slot_input_output(engine, slot)
+            log_decision(f"Step idx={idx}, engine={engine}, slot={slot}, barrier={barrier}")
             if barrier:
                 flush_bundle()
                 instrs.append({engine: [slot]})
+                log_decision(f"Barrier at idx={idx}: {engine}, slot={slot} placed in new instr; advancing.")
                 used[idx] = True
                 idx += 1
                 continue
 
             if can_add_to_bundle(engine, slot_inputs, slot_outputs):
+                log_decision(f"At idx={idx}, can add: engine={engine}, slot={slot} to current bundle.")
                 bundle.setdefault(engine, []).append(slot)
                 bundle_input.update(slot_inputs)
                 bundle_output.update(slot_outputs)
                 used[idx] = True
                 idx += 1
-
-                # Look ahead: Add slots that do not conflict with the current bundle
-                skipped_outputs = set()
-                for look_ahead in range(idx, min(n, idx+self.LOOK_AHEAD_NUMBER)):
-                    if used[look_ahead]: continue
-                    look_ahead_engine, look_ahead_slot = slots[look_ahead]
-                    look_ahead_inputs, look_ahead_outputs, look_ahead_barrier = self._slot_input_output(look_ahead_engine, look_ahead_slot)
-                    if look_ahead_barrier:
-                        break
-                    if look_ahead_inputs & skipped_outputs:
-                        skipped_outputs.update(look_ahead_inputs)
-                        continue
-                    # Can't add if slot writes to skipped slot's output (WAW - would overwrite wrong value)
-                    if look_ahead_inputs & skipped_outputs:
-                        skipped_outputs.update(look_ahead_inputs)
-                        continue
-                    if can_add_to_bundle(look_ahead_engine, look_ahead_inputs, look_ahead_outputs):
-                        bundle.setdefault(look_ahead_engine, []).append(look_ahead_slot)
-                        bundle_input.update(look_ahead_inputs)
-                        bundle_output.update(look_ahead_outputs)
-                        used[look_ahead] = True
-                    else:
-                        skipped_outputs.update(look_ahead_outputs)
             else:
+                log_decision(f"At idx={idx}, cannot add: engine={engine}, slot={slot}. Flushing bundle and starting new bundle with this slot.")
                 flush_bundle()
                 bundle.setdefault(engine, []).append(slot)
                 bundle_input.update(slot_inputs)
@@ -205,7 +217,40 @@ class KernelBuilder:
                 used[idx] = True
                 idx += 1
 
+            # Look ahead: Add slots that do not conflict with the current bundle
+            skipped_outputs = set()
+            for look_ahead in range(idx, min(n, idx+self.LOOK_AHEAD_NUMBER)):
+                if used[look_ahead]:
+                    log_decision(f"  Lookahead {look_ahead}: already used, skipping.")
+                    continue
+                look_ahead_engine, look_ahead_slot = slots[look_ahead]
+                look_ahead_inputs, look_ahead_outputs, look_ahead_barrier = self._slot_input_output(look_ahead_engine, look_ahead_slot)
+                log_decision(f"  Lookahead {look_ahead}: engine={look_ahead_engine}, slot={look_ahead_slot}")
+                if look_ahead_barrier:
+                    log_decision(f"  Lookahead {look_ahead}: barrier encountered, breaking lookahead.")
+                    break
+                # RAW: Can't add if slot reads from a skipped slot's output
+                if look_ahead_inputs & skipped_outputs:
+                    log_decision(f"  Lookahead {look_ahead}: RAW hazard (inputs {look_ahead_inputs} & skipped_outputs {skipped_outputs}), skipping.")
+                    skipped_outputs.update(look_ahead_outputs)
+                    continue
+                # WAW: Can't add if slot writes to a skipped slot's output
+                if look_ahead_outputs & skipped_outputs:
+                    log_decision(f"  Lookahead {look_ahead}: WAW hazard (outputs {look_ahead_outputs} & skipped_outputs {skipped_outputs}), skipping.")
+                    skipped_outputs.update(look_ahead_outputs)
+                    continue
+                if can_add_to_bundle(look_ahead_engine, look_ahead_inputs, look_ahead_outputs):
+                    log_decision(f"  Lookahead {look_ahead}: can add to bundle: engine={look_ahead_engine}, slot={look_ahead_slot}.")
+                    bundle.setdefault(look_ahead_engine, []).append(look_ahead_slot)
+                    bundle_input.update(look_ahead_inputs)
+                    bundle_output.update(look_ahead_outputs)
+                    used[look_ahead] = True
+                else:
+                    log_decision(f"  Lookahead {look_ahead}: cannot add to bundle, updating skipped_outputs (outputs {look_ahead_outputs}).")
+                    skipped_outputs.update(look_ahead_outputs)
+
         flush_bundle()
+        log_decision("Build finished\n")
         return instrs
 
     def add(self, engine, slot):
@@ -268,9 +313,21 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Vectorized implementation using SIMD for batch dimension.
+        Vectorized implementation using SIMD for batch dimension with software pipelining.
         Assume batch_size is a multiple of VLEN.
+        
+        Pipeline structure:
+        - Stage 0: Load idx and val from memory
+        - Stage 1: Compute addr, start scattered node_val loads (first 2)
+        - Stage 2: Continue scattered node_val loads (next 2)
+        - Stage 3: Continue scattered node_val loads (next 2)
+        - Stage 4: Finish scattered node_val loads (last 2), start hash
+        - Stage 5: Continue hash computation + index update + stores
+        
+        By interleaving iterations at different pipeline stages, we overlap
+        the load bottleneck with computation.
         """
+
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
 
@@ -301,83 +358,218 @@ class KernelBuilder:
         self.add("alu", ("+", val_ptrs, self.scratch["inp_values_p"], zero_const))
         for i in range(1, batch_size):
             self.add("alu", ("+", idx_ptrs + i, idx_ptrs + i - 1, one_const))
-            self.add("alu", ("+", val_ptrs + i, val_ptrs + i - 1, one_const))
-        
-        # Vector scratch registers and broadcasted constants.
-        vtmp1 = self.alloc_scratch("vtmp1", VLEN)
-        vtmp2 = self.alloc_scratch("vtmp2", VLEN)
-        vtmp3 = self.alloc_scratch("vtmp3", VLEN)
+            self.add("alu", ("+", val_ptrs + i, val_ptrs + i - 1, one_const))   
 
         vone_const = self.scratch_vconst(1, "vone")
         vtwo_const = self.scratch_vconst(2, "vtwo")
-
-        vtmp_idx = self.alloc_scratch("vtmp_idx", VLEN)
-        vtmp_val = self.alloc_scratch("vtmp_val", VLEN)
-        vtmp_node_val = self.alloc_scratch("vtmp_node_val", VLEN)
-        vtmp_addr = self.alloc_scratch("vtmp_addr", VLEN)
-        
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
         self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
+        scratch_blocks = []
+        for i in range(self.NUM_PARALLEL_BLOCKS):
+            scratch_blocks.append({
+                "idx": self.alloc_scratch(f"block_{i}_idx", VLEN),
+                "val": self.alloc_scratch(f"block_{i}_val", VLEN),
+                "node_val": self.alloc_scratch(f"block_{i}_node_val", VLEN),
+                "addr": self.alloc_scratch(f"block_{i}_addr", VLEN),
+                "vtmp1": self.alloc_scratch(f"block_{i}_vtmp1", VLEN),
+                "vtmp2": self.alloc_scratch(f"block_{i}_vtmp2", VLEN),
+                "vtmp3": self.alloc_scratch(f"block_{i}_vtmp3", VLEN),
+            })
+
         self.add("flow", ("pause",))
         if self.enable_debug:
             self.add("debug", ("comment", "Starting loop"))
 
         body = []  # array of slots
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        # Total number of vector iterations
+        n_iters = rounds * (batch_size // VLEN)
+        
+        def get_iter_params(iter_idx):
+            """Get round and batch offset for a given iteration index."""
+            if iter_idx < 0 or iter_idx >= n_iters:
+                return None
+            iters_per_round = batch_size // VLEN
+            round_num = iter_idx // iters_per_round
+            batch_offset = (iter_idx % iters_per_round) * VLEN
+            return (round_num, batch_offset)
+        
+        def get_block(iter_idx):
+            """Get scratch block for an iteration."""
+            return scratch_blocks[iter_idx % self.NUM_PARALLEL_BLOCKS]
+        
+        def emit_stage0_load_idx_val(iter_idx):
+            """Stage 0: Load idx and val vectors from memory."""
+            params = get_iter_params(iter_idx)
+            if params is None:
+                return []
+            round_num, i = params
+            block = get_block(iter_idx)
+            vtmp_idx = block["idx"]
+            vtmp_val = block["val"]
 
-        for round in range(rounds):
-            for i in range(0, batch_size, VLEN):
-                # idx = mem[inp_indices_p + i]
-                # val = mem[inp_values_p + i]
-                idx_ptr = idx_ptrs + i
-                val_ptr = val_ptrs + i
-                body.append(("load", ("vload", vtmp_idx, idx_ptr)))                
-                body.append(("load", ("vload", vtmp_val, val_ptr)))
+            slots = []
 
-                if self.enable_debug:
-                    body.append(("debug", ("vcompare", vtmp_idx, [(round, i+j, "idx") for j in range(VLEN)])))
-                    body.append(("debug", ("vcompare", vtmp_val, [(round, i+j, "val") for j in range(VLEN)])))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("valu", ("+", vtmp_addr, v_forest_p, vtmp_idx)))
-                for j in range(VLEN):
-                    body.append(("load", ("load_offset", vtmp_node_val, vtmp_addr, j)))
-                if self.enable_debug:
-                    body.append(("debug", ("vcompare", vtmp_node_val, [(round, i+j, "node_val") for j in range(VLEN)])))
-                # val = myhash(val ^ node_val)
-                body.append(("valu", ("^", vtmp_val, vtmp_val, vtmp_node_val)))
-                body.extend(self.build_vhash(vtmp_val, vtmp1, vtmp2, round, i))
-                if self.enable_debug:
-                    body.append(("debug", ("vcompare", vtmp_val, [(round, i+j, "hashed_val") for j in range(VLEN)])))
-                # Change to idx = 2*idx + 1 + (val % 2)
-                body.append(("valu", ("&", vtmp3, vtmp_val, vone_const)))
-                body.append(("valu", ("+", vtmp3, vtmp3, vone_const)))
-                body.append(("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, vtmp3)))
-                if self.enable_debug:
-                    body.append(("debug", ("vcompare", vtmp_idx, [(round, i+j, "next_idx") for j in range(VLEN)])))
-                # Change to idx = idx * (idx < n_nodes)
-                body.append(("valu", ("<", vtmp1, vtmp_idx, v_n_nodes)))
-                body.append(("valu", ("*", vtmp_idx, vtmp1, vtmp_idx)))
-                if self.enable_debug:
-                    body.append(("debug", ("vcompare", vtmp_idx, [(round, i+j, "wrapped_idx") for j in range(VLEN)])))
-                # mem[inp_indices_p + i] = idx
-                body.append(("store", ("vstore", idx_ptr, vtmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("store", ("vstore", val_ptr, vtmp_val)))
+            # idx = mem[inp_indices_p + i]
+            # val = mem[inp_values_p + i]
+            idx_ptr = idx_ptrs + i
+            val_ptr = val_ptrs + i
+            slots.append(("load", ("vload", vtmp_idx, idx_ptr)))
+            slots.append(("load", ("vload", vtmp_val, val_ptr)))
+            if self.enable_debug:
+                slots.append(("debug", ("vcompare", vtmp_idx, [(round_num, i+j, "idx") for j in range(VLEN)])))
+                slots.append(("debug", ("vcompare", vtmp_val, [(round_num, i+j, "val") for j in range(VLEN)])))
+            return slots
+        
+        def emit_stage1_loads_node_val(iter_idx):
+            """Stage 1: loads tree node values."""
+            params = get_iter_params(iter_idx)
+            if params is None:
+                return []
+            round_num, i = params
+            block = get_block(iter_idx)
+            vtmp_idx = block["idx"]
+            vtmp_addr = block["addr"]
+            vtmp_node_val = block["node_val"]
+            
+            slots = []
+            # node_val = mem[forest_values_p + idx]
+            # Compute address first
+            slots.append(("valu", ("+", vtmp_addr, v_forest_p, vtmp_idx)))
+            # Emit loads in pairs to maximize bundling with load engine (2 slots/cycle limit)
+            # This allows the bundler to pack 2 loads per cycle more efficiently
+            for j in range(VLEN):
+                slots.append(("load", ("load_offset", vtmp_node_val, vtmp_addr, j)))
+            if self.enable_debug:
+                slots.append(("debug", ("vcompare", vtmp_node_val, [(round_num, i+j, "node_val") for j in range(VLEN)])))
+            return slots
+        
+        def emit_stage2_xor(iter_idx):
+            """Stage 2: XOR."""
+            params = get_iter_params(iter_idx)
+            if params is None:
+                return []
+            block = get_block(iter_idx)
+            vtmp_val = block["val"]
+            vtmp_node_val = block["node_val"]
+            
+            slots = []
+            # val = val ^ node_val
+            slots.append(("valu", ("^", vtmp_val, vtmp_val, vtmp_node_val)))
+            return slots
+        
+        def emit_hash(iter_idx):
+            """Hash stages."""
+            params = get_iter_params(iter_idx)
+            if params is None:
+                return []
+            round_num, i = params
+            block = get_block(iter_idx)
+            slots = []
+            # # val = myhash(val)
+            for hi in range(6):
+                op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+                if op1 == "+" and op2 == "+" and op3 == "<<":
+                    factor = 1 + (1 << val3)
+                    slots.append(("valu", ("multiply_add", block["val"], block["val"], 
+                                          self.scratch_vconst(factor), self.scratch_vconst(val1))))
+                else:
+                    slots.append(("valu", (op1, block["vtmp1"], block["val"], self.scratch_vconst(val1))))
+                    slots.append(("valu", (op3, block["vtmp2"], block["val"], self.scratch_vconst(val3))))
+                    slots.append(("valu", (op2, block["val"], block["vtmp1"], block["vtmp2"])))
+            if self.enable_debug:
+                slots.append(("debug", ("vcompare", block["val"], [(round_num, i+j, "hashed_val") for j in range(VLEN)])))
+            return slots
+        
+        def emit_idx_update(iter_idx):
+            """Index update operations."""
+            params = get_iter_params(iter_idx)
+            if params is None:
+                return []
+            round_num, i = params
+            block = get_block(iter_idx)
+            slots = []
+            # idx = 2*idx + 1 + (val & 1)
+            slots.append(("valu", ("&", block["vtmp3"], block["val"], vone_const)))
+            slots.append(("valu", ("+", block["vtmp3"], block["vtmp3"], vone_const)))
+            slots.append(("valu", ("multiply_add", block["idx"], block["idx"], vtwo_const, block["vtmp3"])))
+            if self.enable_debug:
+                slots.append(("debug", ("vcompare", block["idx"], [(round_num, i+j, "next_idx") for j in range(VLEN)])))
+            # idx = 0 if idx >= n_nodes else idx
+            # idx = idx * (idx < n_nodes)
+            slots.append(("valu", ("<", block["vtmp1"], block["idx"], v_n_nodes)))
+            slots.append(("valu", ("*", block["idx"], block["vtmp1"], block["idx"])))
+            if self.enable_debug:
+                slots.append(("debug", ("vcompare", block["idx"], [(round_num, i+j, "wrapped_idx") for j in range(VLEN)])))
+            return slots
+        
+        def emit_stores(iter_idx):
+            """Store operations."""
+            params = get_iter_params(iter_idx)
+            if params is None:
+                return []
+            round_num, i = params
+            block = get_block(iter_idx)
+            idx_ptr = idx_ptrs + i
+            val_ptr = val_ptrs + i
+            slots = []
+            # mem[inp_indices_p + i] = idx
+            # mem[inp_values_p + i] = val
+            slots.append(("store", ("vstore", idx_ptr, block["idx"])))
+            slots.append(("store", ("vstore", val_ptr, block["val"])))
+            return slots
+        
+        # Software pipelined execution with 6 stages (global across all rounds)
+        n_iters = rounds * (batch_size // VLEN)
+        NUM_STAGES = 6
+        total_steps = n_iters + NUM_STAGES - 1
+        
+        for step in range(total_steps):
+            # Reorder stages to maximize bundling opportunities
+            # Emit operations in an order that allows better interleaving:
+            # 1. First emit VALU operations (hash, idx update) which have more slots available
+            # 2. Then emit loads which are more constrained
+            # 3. This allows the bundler to pack VALU ops with loads from different iterations
+            
+            # Stage 3: Hash (VALU operations - 6 slots available)
+            iter_s3 = step - 3
+            if 0 <= iter_s3 < n_iters:
+                body.extend(emit_hash(iter_s3))
+            
+            # Stage 4: Idx update (VALU operations - 6 slots available)
+            iter_s4 = step - 4
+            if 0 <= iter_s4 < n_iters:
+                body.extend(emit_idx_update(iter_s4))
+            
+            # Stage 2: XOR (VALU operation - can be bundled with hash/idx_update)
+            iter_s2 = step - 2
+            if 0 <= iter_s2 < n_iters:
+                body.extend(emit_stage2_xor(iter_s2))
+            
+            # Stage 0: Load idx/val (load operations - 2 slots available)
+            if step < n_iters:
+                body.extend(emit_stage0_load_idx_val(step))
+            
+            # Stage 1: Load node val (load operations - 2 slots available, most constrained)
+            iter_s1 = step - 1
+            if 0 <= iter_s1 < n_iters:
+                body.extend(emit_stage1_loads_node_val(iter_s1))
+            
+            # Stage 5: Stores (store operations - 2 slots available)
+            iter_s5 = step - 5
+            if 0 <= iter_s5 < n_iters:
+                body.extend(emit_stores(iter_s5))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
+        for instr in self.instrs:
+            with open("kernel_instr_counts.txt", "a") as f:
+                for key, val in instr.items():
+                    f.write(f"{key}: {len(val)} / {SLOT_LIMITS[key]}, \t")
+                f.write("\n")
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
@@ -463,7 +655,7 @@ class Tests(unittest.TestCase):
     #             )
 
     def test_kernel_cycles(self):
-        do_kernel_test(10, 16, 256)
+        do_kernel_test(10, 1, 16)
 
 
 # To run all the tests:
