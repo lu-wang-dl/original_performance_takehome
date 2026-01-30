@@ -37,13 +37,8 @@ from problem import (
 )
 
 class KernelBuilder:
-    __slots__ = (
-        'instrs', 'scratch', 'scratch_debug', 'scratch_ptr',
-        'const_map', 'vconst_map', 'enable_debug', 'enable_bundle_logging'
-    )
-
     LOOK_AHEAD_NUMBER = 100
-    NUM_PARALLEL_BLOCKS = 16
+    NUM_PARALLEL_BLOCKS = 8
 
     def __init__(self):
         self.instrs = []
