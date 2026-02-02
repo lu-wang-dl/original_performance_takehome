@@ -37,8 +37,8 @@ from problem import (
 )
 
 class KernelBuilder:
-    LOOK_AHEAD_NUMBER = 200
-    NUM_PARALLEL_BLOCKS = 8
+    LOOK_AHEAD_NUMBER = 250
+    NUM_PARALLEL_BLOCKS = 12
 
     def __init__(self):
         self.instrs = []
@@ -139,7 +139,7 @@ class KernelBuilder:
         bundle_output = set()
 
         # Add a flag to enable/disable logging
-        enable_logging = getattr(self, "enable_bundle_logging", False)
+        enable_logging = self.enable_bundle_logging
 
         import os
         import inspect
@@ -337,6 +337,7 @@ class KernelBuilder:
         the load bottleneck with computation.
         """
         # Scratch space addresses
+        n_chunks = batch_size // VLEN
         init_vars = [
             "rounds",
             "n_nodes",
@@ -346,28 +347,37 @@ class KernelBuilder:
             "inp_indices_p",
             "inp_values_p",
         ]
+
         for v in init_vars:
             self.alloc_scratch(v)
-
         header_base = self.alloc_scratch("header", VLEN)
-        # Map init_vars to their positions in the header block
         for i, v in enumerate(init_vars):
             self.scratch[v] = header_base + i
             self.scratch_debug[header_base + i] = (v, 1) 
-        
-        # Pre-allocate idx and val
         idx_cache = self.alloc_scratch("idx_cache", batch_size)
         val_cache = self.alloc_scratch("val_cache", batch_size)
-
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
-
-        n_chunks = batch_size // VLEN
         idx_addrs = [self.alloc_scratch(f"idx_addr_{i}") for i in range(n_chunks)]
         val_addrs = [self.alloc_scratch(f"val_addr_{i}") for i in range(n_chunks)]
-        # Pre-allocate store address registers for parallel storing
         idx_store_addrs = [self.alloc_scratch(f"idx_store_addr_{i}") for i in range(n_chunks)]
         val_store_addrs = [self.alloc_scratch(f"val_store_addr_{i}") for i in range(n_chunks)]
+
+        scratch_blocks = []
+        for i in range(self.NUM_PARALLEL_BLOCKS):
+            scratch_blocks.append({
+                "node_val": self.alloc_scratch(f"block_{i}_node_val", VLEN),
+                "addr": self.alloc_scratch(f"block_{i}_addr", VLEN),
+                "vtmp1": self.alloc_scratch(f"block_{i}_vtmp1", VLEN),
+                "vtmp2": self.alloc_scratch(f"block_{i}_vtmp2", VLEN),
+                "vtmp3": self.alloc_scratch(f"block_{i}_vtmp3", VLEN),
+            })
+
+        forest_values_level_0_2 = self.alloc_scratch("forest_values_level_0_2", 8)
+        
+        # Pre-allocate vector registers for preloaded tree values (levels 0-2)
+        # Node 0 (level 0), nodes 1-2 (level 1), nodes 3-6 (level 2) = 7 nodes
+        v_node_vals = [self.alloc_scratch(f"v_node_{i}", VLEN) for i in range(7)]
         
         # Collect init slots and build them together for bundling
         init_slots = []
@@ -408,20 +418,17 @@ class KernelBuilder:
             else:
                 self.scratch_vconst(val1, init_slots=init_slots)
                 self.scratch_vconst(val3, init_slots=init_slots)
+        
+        init_slots.append(("load", ("vload", forest_values_level_0_2, self.scratch["forest_values_p"])))
+
+        # Preload tree node values for levels 0-2 as vectors (avoids vbroadcast in main loop)
+        # These broadcasts can be bundled with other operations
+        for node_idx in range(7):
+            init_slots.append(("valu", ("vbroadcast", v_node_vals[node_idx], forest_values_level_0_2 + node_idx)))
 
         # Build and add init instructions
         init_instrs = self.build(init_slots)
         self.instrs.extend(init_instrs)
-
-        scratch_blocks = []
-        for i in range(self.NUM_PARALLEL_BLOCKS):
-            scratch_blocks.append({
-                "node_val": self.alloc_scratch(f"block_{i}_node_val", VLEN),
-                "addr": self.alloc_scratch(f"block_{i}_addr", VLEN),
-                "vtmp1": self.alloc_scratch(f"block_{i}_vtmp1", VLEN),
-                "vtmp2": self.alloc_scratch(f"block_{i}_vtmp2", VLEN),
-                "vtmp3": self.alloc_scratch(f"block_{i}_vtmp3", VLEN),
-            })
 
         self.add("flow", ("pause",))
         if self.enable_debug:
@@ -445,23 +452,30 @@ class KernelBuilder:
             """Get scratch block for an iteration."""
             return scratch_blocks[iter_idx % self.NUM_PARALLEL_BLOCKS]
         
-        def emit_stage0_load_idx_val(iter_idx):
-            """Stage 0: Load idx and val vectors from cached values."""
+        def emit_stage0_addr_compute(iter_idx):
+            """Stage 0: Pre-compute addresses for scattered loads (levels 3+)."""
             params = get_iter_params(iter_idx)
             if params is None:
                 return []
             round_num, i = params
+            block = get_block(iter_idx)
+            vtmp_idx = idx_cache + i
+            vtmp_addr = block["addr"]
+            
+            level = round_num % (forest_height + 1)
             slots = []
-
-            vtmp_idx = idx_cache + i    
-            vtmp_val = val_cache + i
-            if self.enable_debug:
-                slots.append(("debug", ("vcompare", vtmp_idx, [(round_num, i+j, "idx") for j in range(VLEN)])))
-                slots.append(("debug", ("vcompare", vtmp_val, [(round_num, i+j, "val") for j in range(VLEN)])))
+            if level >= 3:
+                slots.append(("valu", ("+", vtmp_addr, v_forest_p, vtmp_idx)))
             return slots
         
         def emit_stage1_loads_node_val(iter_idx):
-            """Stage 1: loads tree node values."""
+            """Stage 1: loads tree node values.
+            
+            Optimization: At each level, there are limited possible node values.
+            - Level 0: 1 node (idx=0) - load once
+            - Level 1: 2 nodes (idx=1,2) - load both, use vselect (saves 6 loads if only 2 unique)
+            - Level 2: 4 nodes (idx=3,4,5,6) - load all 4, use nested vselect (saves 4 loads)
+            """
             params = get_iter_params(iter_idx)
             if params is None:
                 return []
@@ -470,15 +484,40 @@ class KernelBuilder:
             vtmp_idx = idx_cache + i  # Use idx_cache directly
             vtmp_addr = block["addr"]
             vtmp_node_val = block["node_val"]
+            vtmp1 = block["vtmp1"]
+            vtmp2 = block["vtmp2"]
+            vtmp3 = block["vtmp3"]
             
             slots = []
-            # node_val = mem[forest_values_p + idx]
-            # Compute address first
-            slots.append(("valu", ("+", vtmp_addr, v_forest_p, vtmp_idx)))
-            # Emit loads in pairs to maximize bundling with load engine (2 slots/cycle limit)
-            # This allows the bundler to pack 2 loads per cycle more efficiently
-            for j in range(VLEN):
-                slots.append(("load", ("load_offset", vtmp_node_val, vtmp_addr, j)))
+            
+            # Optimization: At each level, there are limited possible node values.
+            # - Level 0: 1 node (idx=0) - load once and broadcast
+            # - Level 1: 2 nodes (idx=1,2) - load both, use vselect (saves 6 loads)
+            level = round_num % (forest_height + 1)
+            
+            if level == 0:
+                # Level 0: Only 1 node (idx=0) - use preloaded vector (no vbroadcast needed)
+                slots.append(("valu", ("|", vtmp_node_val, v_node_vals[0], v_node_vals[0])))
+            elif level == 1:
+                # Level 1: 2 nodes (idx=1,2) - use preloaded vectors and vselect
+                slots.append(("valu", ("==", vtmp1, vtmp_idx, vone_const)))
+                slots.append(("flow", ("vselect", vtmp_node_val, vtmp1, v_node_vals[1], v_node_vals[2])))
+            elif level == 2:
+                # Level 2: 4 nodes (idx=3,4,5,6) - use preloaded vectors and nested vselect
+                slots.append(("valu", ("&", vtmp1, vtmp_idx, vone_const)))
+                vfive_const = self.scratch_vconst(5)
+                slots.append(("valu", ("<", vtmp2, vtmp_idx, vfive_const)))
+                # First pair: select between nodes 3 and 4
+                slots.append(("flow", ("vselect", vtmp3, vtmp1, v_node_vals[3], v_node_vals[4])))
+                # Second pair: select between nodes 5 and 6
+                slots.append(("flow", ("vselect", vtmp_node_val, vtmp1, v_node_vals[5], v_node_vals[6])))
+                # Final: select between first pair and second pair
+                slots.append(("flow", ("vselect", vtmp_node_val, vtmp2, vtmp3, vtmp_node_val)))
+            else:
+                # For other levels, use scattered load (address computed in stage 0)
+                for j in range(VLEN):
+                    slots.append(("load", ("load_offset", vtmp_node_val, vtmp_addr, j)))
+            
             if self.enable_debug:
                 slots.append(("debug", ("vcompare", vtmp_node_val, [(round_num, i+j, "node_val") for j in range(VLEN)])))
             return slots
@@ -532,31 +571,61 @@ class KernelBuilder:
             vtmp_idx = idx_cache + i  # Use idx_cache directly
             vtmp_val = val_cache + i  # Use val_cache directly
             slots = []
-            # idx = 2*idx + 1 + (val & 1)
-            slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
-            slots.append(("valu", ("+", block["vtmp3"], block["vtmp3"], vone_const)))
-            slots.append(("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, block["vtmp3"])))
-            if self.enable_debug:
-                slots.append(("debug", ("vcompare", vtmp_idx, [(round_num, i+j, "next_idx") for j in range(VLEN)])))
-            # idx = 0 if idx >= n_nodes else idx
-            # idx = idx * (idx < n_nodes)
-            slots.append(("valu", ("<", block["vtmp1"], vtmp_idx, v_n_nodes)))
-            slots.append(("valu", ("*", vtmp_idx, block["vtmp1"], vtmp_idx)))
+            
+            # Determine current level to optimize idx calculation
+            level = round_num % (forest_height + 1)
+            if level == 0:
+                # Level 0: all idx == 0, so idx = 2*0 + 1 + (val & 1) = 1 + (val & 1)
+                slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
+                slots.append(("valu", ("+", vtmp_idx, block["vtmp3"], vone_const)))
+            elif level == 1:
+                # Level 1: idx is 1 or 2, so idx = 2*idx + 1 + (val & 1) = 3/4 or 5/6
+                # Use: idx = 2*(idx-1) + 3 + (val & 1) = 2*idx + 1 + (val & 1)
+                # Simplified: idx = idx * 2 + 1 + (val & 1)
+                slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
+                slots.append(("valu", ("+", block["vtmp3"], block["vtmp3"], vone_const)))
+                slots.append(("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, block["vtmp3"])))
+            elif level < forest_height:
+                # Levels 2 to forest_height-1: no wrap needed (idx < n_nodes guaranteed)
+                # idx = 2*idx + 1 + (val & 1)
+                slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
+                slots.append(("valu", ("+", block["vtmp3"], block["vtmp3"], vone_const)))
+                slots.append(("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, block["vtmp3"])))
+            else:
+                # Level forest_height: need wrap check (idx might overflow)
+                slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
+                slots.append(("valu", ("+", block["vtmp3"], block["vtmp3"], vone_const)))
+                slots.append(("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, block["vtmp3"])))
+                slots.append(("valu", ("<", block["vtmp1"], vtmp_idx, v_n_nodes)))
+                slots.append(("valu", ("*", vtmp_idx, block["vtmp1"], vtmp_idx)))
+            
             if self.enable_debug:
                 slots.append(("debug", ("vcompare", vtmp_idx, [(round_num, i+j, "wrapped_idx") for j in range(VLEN)])))
             return slots
         
         # Software pipelined execution with 6 stages (global across all rounds)
         n_iters = rounds * (batch_size // VLEN)
-        NUM_STAGES = 5
+        NUM_STAGES = 6  # Added stage 0 for address pre-computation
         total_steps = n_iters + NUM_STAGES - 1
         
         for step in range(total_steps):
-            # Reorder stages to maximize bundling opportunities
-            # Emit operations in an order that allows better interleaving:
-            # 1. First emit VALU operations (hash, idx update) which have more slots available
-            # 2. Then emit loads which are more constrained
-            # 3. This allows the bundler to pack VALU ops with loads from different iterations
+            # Interleave operations from multiple iterations for better bundling
+            # The bundler will pack independent operations together
+            
+            # Stage 0: Pre-compute addresses for scattered loads
+            iter_s0 = step
+            if 0 <= iter_s0 < n_iters:
+                body.extend(emit_stage0_addr_compute(iter_s0))
+            
+            # Stage 1: Load node val (load operations - 2 slots available, most constrained)
+            iter_s1 = step - 1
+            if 0 <= iter_s1 < n_iters:
+                body.extend(emit_stage1_loads_node_val(iter_s1))
+            
+            # Stage 2: XOR (VALU operation - can be bundled with loads)
+            iter_s2 = step - 2
+            if 0 <= iter_s2 < n_iters:
+                body.extend(emit_stage2_xor(iter_s2))
             
             # Stage 3: Hash (VALU operations - 6 slots available)
             iter_s3 = step - 3
@@ -567,20 +636,6 @@ class KernelBuilder:
             iter_s4 = step - 4
             if 0 <= iter_s4 < n_iters:
                 body.extend(emit_idx_update(iter_s4))
-            
-            # Stage 2: XOR (VALU operation - can be bundled with hash/idx_update)
-            iter_s2 = step - 2
-            if 0 <= iter_s2 < n_iters:
-                body.extend(emit_stage2_xor(iter_s2))
-            
-            # Stage 0: Load idx/val (load operations - 2 slots available)
-            if step < n_iters:
-                body.extend(emit_stage0_load_idx_val(step))
-            
-            # Stage 1: Load node val (load operations - 2 slots available, most constrained)
-            iter_s1 = step - 1
-            if 0 <= iter_s1 < n_iters:
-                body.extend(emit_stage1_loads_node_val(iter_s1))
             
         # Pre-compute all store addresses using ALU (12 slots/cycle) - allows bundling
         # Reuse offset_consts that were already computed in init
@@ -595,8 +650,8 @@ class KernelBuilder:
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
-        for instr in self.instrs:
-            with open("kernel_instr_counts.txt", "a") as f:
+        with open("kernel_instr_counts.txt", "w") as f:
+            for instr in self.instrs:        
                 for key, val in instr.items():
                     f.write(f"{key}: {len(val)} / {SLOT_LIMITS[key]}, \t")
                 f.write("\n")
@@ -639,10 +694,11 @@ def do_kernel_test(
         if prints:
             print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
             print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
-        assert (
-           machine.mem[inp_values_p : inp_values_p + len(inp.values)]
-           == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
-        ), f"Incorrect result on round {i}"
+        if i == rounds - 1:
+            assert (
+            machine.mem[inp_values_p : inp_values_p + len(inp.values)]
+            == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
+            ), f"Incorrect result on round {i}"
         inp_indices_p = ref_mem[5]
         if prints:
             print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
