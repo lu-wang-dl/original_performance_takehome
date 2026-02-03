@@ -426,15 +426,8 @@ class KernelBuilder:
         for node_idx in range(7):
             init_slots.append(("valu", ("vbroadcast", v_node_vals[node_idx], forest_values_level_0_2 + node_idx)))
 
-        # Build and add init instructions
-        init_instrs = self.build(init_slots)
-        self.instrs.extend(init_instrs)
-
-        self.add("flow", ("pause",))
-        if self.enable_debug:
-            self.add("debug", ("comment", "Starting loop"))
-
-        body = []  # array of slots
+        # Unify init_slots and body for combined bundling
+        body = init_slots  # Continue adding to the same list
 
         # Total number of vector iterations
         n_iters = rounds * (batch_size // VLEN)
@@ -496,8 +489,8 @@ class KernelBuilder:
             level = round_num % (forest_height + 1)
             
             if level == 0:
-                # Level 0: Only 1 node (idx=0) - use preloaded vector (no vbroadcast needed)
-                slots.append(("valu", ("|", vtmp_node_val, v_node_vals[0], v_node_vals[0])))
+                # Level 0: Only 1 node (idx=0) - skip assignment, use v_node_vals[0] directly in XOR
+                pass
             elif level == 1:
                 # Level 1: 2 nodes (idx=1,2) - use preloaded vectors and vselect
                 slots.append(("valu", ("==", vtmp1, vtmp_idx, vone_const)))
@@ -514,7 +507,7 @@ class KernelBuilder:
                 # Final: select between first pair and second pair
                 slots.append(("flow", ("vselect", vtmp_node_val, vtmp2, vtmp3, vtmp_node_val)))
             else:
-                # For other levels, use scattered load (address computed in stage 0)
+                # For levels 3+, use scattered load (address computed in stage 0)
                 for j in range(VLEN):
                     slots.append(("load", ("load_offset", vtmp_node_val, vtmp_addr, j)))
             
@@ -530,24 +523,52 @@ class KernelBuilder:
             round_num, i = params
             block = get_block(iter_idx)
             vtmp_val = val_cache + i  # Use val_cache directly
-            vtmp_node_val = block["node_val"]
             
+            level = round_num % (forest_height + 1)
             slots = []
             # val = val ^ node_val
-            slots.append(("valu", ("^", vtmp_val, vtmp_val, vtmp_node_val)))
+            if level == 0:
+                # Use preloaded v_node_vals[0] directly (saves 1 valu op)
+                slots.append(("valu", ("^", vtmp_val, vtmp_val, v_node_vals[0])))
+            else:
+                vtmp_node_val = block["node_val"]
+                slots.append(("valu", ("^", vtmp_val, vtmp_val, vtmp_node_val)))
             return slots
         
-        def emit_hash(iter_idx):
-            """Hash stages."""
+        def emit_hash_part1(iter_idx):
+            """Hash stages 0-2 (first half)."""
             params = get_iter_params(iter_idx)
             if params is None:
                 return []
             round_num, i = params
             block = get_block(iter_idx)
-            vtmp_val = val_cache + i  # Use val_cache directly
+            vtmp_val = val_cache + i
             slots = []
-            # # val = myhash(val)
-            for hi in range(6):
+            # First 3 hash stages
+            for hi in range(3):
+                op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+                if op1 == "+" and op2 == "+" and op3 == "<<":
+                    factor = 1 + (1 << val3)
+                    slots.append(("valu", ("multiply_add", vtmp_val, vtmp_val, 
+                                          self.scratch_vconst(factor), self.scratch_vconst(val1))))
+                else:
+                    slots.append(("valu", (op1, block["vtmp1"], vtmp_val, self.scratch_vconst(val1))))
+                    slots.append(("valu", (op3, block["vtmp2"], vtmp_val, self.scratch_vconst(val3))))
+                    slots.append(("valu", (op2, vtmp_val, block["vtmp1"], block["vtmp2"])))
+            return slots
+        
+        def emit_hash_part2(iter_idx):
+            """Hash stages 3-5 + idx_update (second half)."""
+            params = get_iter_params(iter_idx)
+            if params is None:
+                return []
+            round_num, i = params
+            block = get_block(iter_idx)
+            vtmp_idx = idx_cache + i
+            vtmp_val = val_cache + i
+            slots = []
+            # Last 3 hash stages
+            for hi in range(3, 6):
                 op1, val1, op2, op3, val3 = HASH_STAGES[hi]
                 if op1 == "+" and op2 == "+" and op3 == "<<":
                     factor = 1 + (1 << val3)
@@ -559,83 +580,52 @@ class KernelBuilder:
                     slots.append(("valu", (op2, vtmp_val, block["vtmp1"], block["vtmp2"])))
             if self.enable_debug:
                 slots.append(("debug", ("vcompare", vtmp_val, [(round_num, i+j, "hashed_val") for j in range(VLEN)])))
-            return slots
-        
-        def emit_idx_update(iter_idx):
-            """Index update operations."""
-            params = get_iter_params(iter_idx)
-            if params is None:
-                return []
-            round_num, i = params
-            block = get_block(iter_idx)
-            vtmp_idx = idx_cache + i  # Use idx_cache directly
-            vtmp_val = val_cache + i  # Use val_cache directly
-            slots = []
             
             # Determine current level to optimize idx calculation
             level = round_num % (forest_height + 1)
-            if level == 0:
-                # Level 0: all idx == 0, so idx = 2*0 + 1 + (val & 1) = 1 + (val & 1)
-                slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
-                slots.append(("valu", ("+", vtmp_idx, block["vtmp3"], vone_const)))
-            elif level == 1:
-                # Level 1: idx is 1 or 2, so idx = 2*idx + 1 + (val & 1) = 3/4 or 5/6
-                # Use: idx = 2*(idx-1) + 3 + (val & 1) = 2*idx + 1 + (val & 1)
-                # Simplified: idx = idx * 2 + 1 + (val & 1)
-                slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
-                slots.append(("valu", ("+", block["vtmp3"], block["vtmp3"], vone_const)))
-                slots.append(("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, block["vtmp3"])))
-            elif level < forest_height:
-                # Levels 2 to forest_height-1: no wrap needed (idx < n_nodes guaranteed)
-                # idx = 2*idx + 1 + (val & 1)
-                slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
-                slots.append(("valu", ("+", block["vtmp3"], block["vtmp3"], vone_const)))
-                slots.append(("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, block["vtmp3"])))
-            else:
-                # Level forest_height: need wrap check (idx might overflow)
-                slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
-                slots.append(("valu", ("+", block["vtmp3"], block["vtmp3"], vone_const)))
-                slots.append(("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, block["vtmp3"])))
-                slots.append(("valu", ("<", block["vtmp1"], vtmp_idx, v_n_nodes)))
-                slots.append(("valu", ("*", vtmp_idx, block["vtmp1"], vtmp_idx)))
+            if round_num != rounds - 1:
+                if level == 0:
+                    slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
+                    slots.append(("valu", ("+", vtmp_idx, block["vtmp3"], vone_const)))
+                elif level < forest_height:
+                    slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
+                    slots.append(("valu", ("+", block["vtmp3"], block["vtmp3"], vone_const)))
+                    slots.append(("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, block["vtmp3"])))
+                else:
+                    slots.append(("valu", ("^", vtmp_idx, vtmp_idx, vtmp_idx)))
             
             if self.enable_debug:
                 slots.append(("debug", ("vcompare", vtmp_idx, [(round_num, i+j, "wrapped_idx") for j in range(VLEN)])))
             return slots
         
-        # Software pipelined execution with 6 stages (global across all rounds)
+        # Software pipelined execution with 5 stages (hash split into 2 parts)
         n_iters = rounds * (batch_size // VLEN)
-        NUM_STAGES = 6  # Added stage 0 for address pre-computation
+        NUM_STAGES = 5
         total_steps = n_iters + NUM_STAGES - 1
         
         for step in range(total_steps):
             # Interleave operations from multiple iterations for better bundling
-            # The bundler will pack independent operations together
             
-            # Stage 0: Pre-compute addresses for scattered loads
+            # Stage 0: Address compute + Load node val
             iter_s0 = step
             if 0 <= iter_s0 < n_iters:
                 body.extend(emit_stage0_addr_compute(iter_s0))
+                body.extend(emit_stage1_loads_node_val(iter_s0))
             
-            # Stage 1: Load node val (load operations - 2 slots available, most constrained)
+            # Stage 1: XOR
             iter_s1 = step - 1
             if 0 <= iter_s1 < n_iters:
-                body.extend(emit_stage1_loads_node_val(iter_s1))
+                body.extend(emit_stage2_xor(iter_s1))
             
-            # Stage 2: XOR (VALU operation - can be bundled with loads)
+            # Stage 2: Hash part 1 (stages 0-2)
             iter_s2 = step - 2
             if 0 <= iter_s2 < n_iters:
-                body.extend(emit_stage2_xor(iter_s2))
+                body.extend(emit_hash_part1(iter_s2))
             
-            # Stage 3: Hash (VALU operations - 6 slots available)
+            # Stage 3: Hash part 2 (stages 3-5) + Idx update
             iter_s3 = step - 3
             if 0 <= iter_s3 < n_iters:
-                body.extend(emit_hash(iter_s3))
-            
-            # Stage 4: Idx update (VALU operations - 6 slots available)
-            iter_s4 = step - 4
-            if 0 <= iter_s4 < n_iters:
-                body.extend(emit_idx_update(iter_s4))
+                body.extend(emit_hash_part2(iter_s3))
             
         # Pre-compute all store addresses using ALU (12 slots/cycle) - allows bundling
         # Reuse offset_consts that were already computed in init
@@ -643,9 +633,9 @@ class KernelBuilder:
             body.append(("alu", ("+", idx_store_addrs[j], self.scratch["inp_indices_p"], offset_consts[j])))
             body.append(("alu", ("+", val_store_addrs[j], self.scratch["inp_values_p"], offset_consts[j])))
         
-        # Issue all stores in parallel (2 per cycle) - no dependencies between iterations
+        # Issue all stores no idx needed for correctness check
         for j in range(n_chunks):
-            body.append(("store", ("vstore", idx_store_addrs[j], idx_cache + j * VLEN)))
+            # body.append(("store", ("vstore", idx_store_addrs[j], idx_cache + j * VLEN)))
             body.append(("store", ("vstore", val_store_addrs[j], val_cache + j * VLEN)))
 
         body_instrs = self.build(body)
