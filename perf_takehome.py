@@ -37,8 +37,8 @@ from problem import (
 )
 
 class KernelBuilder:
-    LOOK_AHEAD_NUMBER = 250
-    NUM_PARALLEL_BLOCKS = 12
+    LOOK_AHEAD_NUMBER = 1000
+    NUM_PARALLEL_BLOCKS = 17
 
     def __init__(self):
         self.instrs = []
@@ -219,6 +219,7 @@ class KernelBuilder:
             # Look ahead: Add slots that do not conflict with the current bundle
             # Use a more aggressive multi-pass approach to find independent operations
             skipped_outputs = set()
+            skipped_inputs = set()  # Track what skipped slots read (for WAR hazards)
             made_progress = True
             while made_progress:
                 made_progress = False
@@ -235,11 +236,19 @@ class KernelBuilder:
                     if look_ahead_inputs & skipped_outputs:
                         log_decision(f"  Lookahead {look_ahead}: RAW hazard (inputs {look_ahead_inputs} & skipped_outputs {skipped_outputs}), skipping.")
                         skipped_outputs.update(look_ahead_outputs)
+                        skipped_inputs.update(look_ahead_inputs)
                         continue
                     # WAW: Can't add if slot writes to a skipped slot's output
                     if look_ahead_outputs & skipped_outputs:
                         log_decision(f"  Lookahead {look_ahead}: WAW hazard (outputs {look_ahead_outputs} & skipped_outputs {skipped_outputs}), skipping.")
                         skipped_outputs.update(look_ahead_outputs)
+                        skipped_inputs.update(look_ahead_inputs)
+                        continue
+                    # WAR: Can't add if slot writes to something a skipped slot reads
+                    if look_ahead_outputs & skipped_inputs:
+                        log_decision(f"  Lookahead {look_ahead}: WAR hazard (outputs {look_ahead_outputs} & skipped_inputs {skipped_inputs}), skipping.")
+                        skipped_outputs.update(look_ahead_outputs)
+                        skipped_inputs.update(look_ahead_inputs)
                         continue
                     if can_add_to_bundle(look_ahead_engine, look_ahead_inputs, look_ahead_outputs):
                         log_decision(f"  Lookahead {look_ahead}: can add to bundle: engine={look_ahead_engine}, slot={look_ahead_slot}.")
@@ -251,6 +260,7 @@ class KernelBuilder:
                     else:
                         log_decision(f"  Lookahead {look_ahead}: cannot add to bundle, updating skipped_outputs (outputs {look_ahead_outputs}).")
                         skipped_outputs.update(look_ahead_outputs)
+                        skipped_inputs.update(look_ahead_inputs)
 
         flush_bundle()
         log_decision("Build finished\n")
@@ -360,8 +370,7 @@ class KernelBuilder:
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
         idx_addrs = [self.alloc_scratch(f"idx_addr_{i}") for i in range(n_chunks)]
         val_addrs = [self.alloc_scratch(f"val_addr_{i}") for i in range(n_chunks)]
-        idx_store_addrs = [self.alloc_scratch(f"idx_store_addr_{i}") for i in range(n_chunks)]
-        val_store_addrs = [self.alloc_scratch(f"val_store_addr_{i}") for i in range(n_chunks)]
+        # Note: val_store_addrs would be same as val_addrs, so we reuse val_addrs for stores
 
         scratch_blocks = []
         for i in range(self.NUM_PARALLEL_BLOCKS):
@@ -399,16 +408,12 @@ class KernelBuilder:
             init_slots.append(("alu", ("+", idx_addrs[j], self.scratch["inp_indices_p"], offset_consts[j])))
             init_slots.append(("alu", ("+", val_addrs[j], self.scratch["inp_values_p"], offset_consts[j])))
         
-        # Issue all loads (2 per cycle) - no dependencies between iterations now
-        for j in range(n_chunks):
-            init_slots.append(("load", ("vload", idx_cache + j * VLEN, idx_addrs[j])))
-            init_slots.append(("load", ("vload", val_cache + j * VLEN, val_addrs[j])))
-        
-        # Broadcasts can happen in parallel with loads (uses valu engine)
+        # Interleave cache loads with broadcasts and other VALU work for better bundling
+        # First, emit the broadcasts that depend on header (loaded above)
         init_slots.append(("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])))
         init_slots.append(("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"])))
 
-        # Pre-allocate hash stage constants
+        # Pre-allocate hash stage constants (these add VALU ops that can overlap with loads)
         for stage_idx in range(len(HASH_STAGES)):
             op1, val1, op2, op3, val3 = HASH_STAGES[stage_idx]
             if op1 == "+" and op2 == "+" and op3 == "<<":
@@ -418,23 +423,21 @@ class KernelBuilder:
             else:
                 self.scratch_vconst(val1, init_slots=init_slots)
                 self.scratch_vconst(val3, init_slots=init_slots)
-        
+
+        # Load tree values for levels 0-2 BEFORE main cache loads (so broadcasts can overlap)
         init_slots.append(("load", ("vload", forest_values_level_0_2, self.scratch["forest_values_p"])))
 
-        # Preload tree node values for levels 0-2 as vectors (avoids vbroadcast in main loop)
-        # These broadcasts can be bundled with other operations
+        # Preload tree node values as vectors - these broadcasts can overlap with cache loads
         for node_idx in range(7):
             init_slots.append(("valu", ("vbroadcast", v_node_vals[node_idx], forest_values_level_0_2 + node_idx)))
 
-        # Build and add init instructions
-        init_instrs = self.build(init_slots)
-        self.instrs.extend(init_instrs)
+        # NOW issue the main cache loads (64 vloads) - bundler can overlap with remaining VALU work
+        for j in range(n_chunks):
+            init_slots.append(("load", ("vload", idx_cache + j * VLEN, idx_addrs[j])))
+            init_slots.append(("load", ("vload", val_cache + j * VLEN, val_addrs[j])))
 
-        self.add("flow", ("pause",))
-        if self.enable_debug:
-            self.add("debug", ("comment", "Starting loop"))
-
-        body = []  # array of slots
+        # Unify init_slots and body for combined bundling
+        body = init_slots  # Continue adding to the same list
 
         # Total number of vector iterations
         n_iters = rounds * (batch_size // VLEN)
@@ -468,36 +471,135 @@ class KernelBuilder:
                 slots.append(("valu", ("+", vtmp_addr, v_forest_p, vtmp_idx)))
             return slots
         
+        def emit_scalar_xor_level012(iter_idx):
+            """
+            Emit 8 scalar ALU XOR operations for levels 0, 1, 2.
+            This uses ALU slots instead of VALU for the XOR, allowing parallel 
+            execution with VALU operations from other iterations.
+            
+            For level 0: node value is fixed at forest_values_level_0_2
+            For levels 1, 2: node values are in block["node_val"] (computed by vselect)
+            """
+            params = get_iter_params(iter_idx)
+            if params is None:
+                return []
+            round_num, batch_offset = params
+            block = get_block(iter_idx)
+            
+            level = round_num % (forest_height + 1)
+            if level > 2:
+               return []  # Only handle levels 0, 1, 2
+            
+            slots = []
+
+            # Special case: use a single VALU XOR for the first chunk
+            if batch_offset % 2 == 0:
+                vtmp_val = val_cache + batch_offset
+                if level == 0:
+                    slots.append(("valu", ("^", vtmp_val, vtmp_val, v_node_vals[0])))
+                else:
+                    slots.append(("valu", ("^", vtmp_val, vtmp_val, block["node_val"])))
+                return slots
+            
+            # Use 8 ALU XORs
+            for j in range(VLEN):
+                val_addr = val_cache + batch_offset + j
+                if level == 0:
+                    # Level 0: XOR with the preloaded node 0 value (fixed)
+                    slots.append(("alu", ("^", val_addr, val_addr, forest_values_level_0_2)))
+                else:
+                    # Levels 1, 2: XOR with node value from vselect result
+                    node_val_addr = block["node_val"] + j
+                    slots.append(("alu", ("^", val_addr, val_addr, node_val_addr)))
+            
+            return slots
+        
+        def emit_scalar_idx_update_level012(iter_idx):
+            """
+            Emit scalar ALU index update for levels 0, 1, 2.
+            Uses ALU slots instead of VALU for idx calculation.
+            
+            idx = 2 * idx + (val & 1) + 1
+            For level 0 (idx starts at 0): new_idx = (val & 1) + 1
+            For levels 1, 2: new_idx = 2 * idx + (val & 1) + 1
+            """
+            params = get_iter_params(iter_idx)
+            if params is None:
+                return []
+            round_num, batch_offset = params
+            block = get_block(iter_idx)
+            
+            level = round_num % (forest_height + 1)
+            if level > 2:
+                return []  # Only handle levels 0, 1, 2
+            
+            # Skip idx update on last round
+            if round_num == rounds - 1:
+                return []
+            
+            slots = []
+
+            # Special case: use VALU for the first chunk
+            if batch_offset == 0:
+                vtmp_val = val_cache + batch_offset
+                vtmp_idx = idx_cache + batch_offset
+                if level == 0:
+                    slots.append(("valu", ("&", block["vtmp1"], vtmp_val, vone_const)))
+                    slots.append(("valu", ("+", vtmp_idx, block["vtmp1"], vone_const)))
+                else:
+                    slots.append(("valu", ("&", block["vtmp1"], vtmp_val, vone_const)))
+                    slots.append(("valu", ("+", block["vtmp1"], block["vtmp1"], vone_const)))
+                    slots.append(("valu", ("+", block["vtmp2"], vtmp_idx, vtmp_idx)))
+                    slots.append(("valu", ("+", vtmp_idx, block["vtmp2"], block["vtmp1"])))
+                return slots
+            
+            for j in range(VLEN):
+                val_addr = val_cache + batch_offset + j
+                idx_addr = idx_cache + batch_offset + j
+                tmp1_addr = block["vtmp1"] + j
+                tmp2_addr = block["vtmp2"] + j
+                
+                if level == 0:
+                    # idx starts at 0: new_idx = (val & 1) + 1
+                    slots.append(("alu", ("&", tmp1_addr, val_addr, one_const)))
+                    slots.append(("alu", ("+", idx_addr, tmp1_addr, one_const)))
+                else:
+                    # General case: new_idx = 2 * idx + (val & 1) + 1
+                    # tmp1 = val & 1
+                    slots.append(("alu", ("&", tmp1_addr, val_addr, one_const)))
+                    # tmp1 = tmp1 + 1
+                    slots.append(("alu", ("+", tmp1_addr, tmp1_addr, one_const)))
+                    # tmp2 = idx + idx (= 2 * idx)
+                    slots.append(("alu", ("+", tmp2_addr, idx_addr, idx_addr)))
+                    # idx = tmp2 + tmp1
+                    slots.append(("alu", ("+", idx_addr, tmp2_addr, tmp1_addr)))
+            
+            return slots
+        
         def emit_stage1_loads_node_val(iter_idx):
             """Stage 1: loads tree node values.
             
-            Optimization: At each level, there are limited possible node values.
-            - Level 0: 1 node (idx=0) - load once
-            - Level 1: 2 nodes (idx=1,2) - load both, use vselect (saves 6 loads if only 2 unique)
-            - Level 2: 4 nodes (idx=3,4,5,6) - load all 4, use nested vselect (saves 4 loads)
+            For levels 0, 1, 2: use preloaded values with vselect
+            For levels 3+: use scattered loads
             """
             params = get_iter_params(iter_idx)
             if params is None:
                 return []
             round_num, i = params
             block = get_block(iter_idx)
-            vtmp_idx = idx_cache + i  # Use idx_cache directly
+            vtmp_idx = idx_cache + i
             vtmp_addr = block["addr"]
             vtmp_node_val = block["node_val"]
             vtmp1 = block["vtmp1"]
             vtmp2 = block["vtmp2"]
             vtmp3 = block["vtmp3"]
             
+            level = round_num % (forest_height + 1)
             slots = []
             
-            # Optimization: At each level, there are limited possible node values.
-            # - Level 0: 1 node (idx=0) - load once and broadcast
-            # - Level 1: 2 nodes (idx=1,2) - load both, use vselect (saves 6 loads)
-            level = round_num % (forest_height + 1)
-            
             if level == 0:
-                # Level 0: Only 1 node (idx=0) - use preloaded vector (no vbroadcast needed)
-                slots.append(("valu", ("|", vtmp_node_val, v_node_vals[0], v_node_vals[0])))
+                # Level 0: handled by scalar ALU XOR, no node_val setup needed
+                pass
             elif level == 1:
                 # Level 1: 2 nodes (idx=1,2) - use preloaded vectors and vselect
                 slots.append(("valu", ("==", vtmp1, vtmp_idx, vone_const)))
@@ -507,51 +609,84 @@ class KernelBuilder:
                 slots.append(("valu", ("&", vtmp1, vtmp_idx, vone_const)))
                 vfive_const = self.scratch_vconst(5)
                 slots.append(("valu", ("<", vtmp2, vtmp_idx, vfive_const)))
-                # First pair: select between nodes 3 and 4
                 slots.append(("flow", ("vselect", vtmp3, vtmp1, v_node_vals[3], v_node_vals[4])))
-                # Second pair: select between nodes 5 and 6
                 slots.append(("flow", ("vselect", vtmp_node_val, vtmp1, v_node_vals[5], v_node_vals[6])))
-                # Final: select between first pair and second pair
                 slots.append(("flow", ("vselect", vtmp_node_val, vtmp2, vtmp3, vtmp_node_val)))
             else:
-                # For other levels, use scattered load (address computed in stage 0)
+                # For levels 3+, use scattered load (address computed in stage 0)
                 for j in range(VLEN):
                     slots.append(("load", ("load_offset", vtmp_node_val, vtmp_addr, j)))
             
-            if self.enable_debug:
+            if self.enable_debug and level > 0:
                 slots.append(("debug", ("vcompare", vtmp_node_val, [(round_num, i+j, "node_val") for j in range(VLEN)])))
             return slots
         
         def emit_stage2_xor(iter_idx):
-            """Stage 2: XOR."""
+            """Stage 2: XOR.
+            
+            Levels 0, 1, 2: handled by emit_scalar_xor_level012 using ALU
+            Levels 3+: use VALU
+            """
             params = get_iter_params(iter_idx)
             if params is None:
                 return []
             round_num, i = params
+            
+            level = round_num % (forest_height + 1)
+            
+            # Levels 0, 1, 2 are handled by scalar ALU XOR
+            if level <= 2:
+                return []
+            
             block = get_block(iter_idx)
-            vtmp_val = val_cache + i  # Use val_cache directly
+            vtmp_val = val_cache + i
             vtmp_node_val = block["node_val"]
             
             slots = []
-            # val = val ^ node_val
             slots.append(("valu", ("^", vtmp_val, vtmp_val, vtmp_node_val)))
             return slots
         
-        def emit_hash(iter_idx):
-            """Hash stages."""
+        def emit_hash_part1(iter_idx):
+            """Hash stages 0-2 (first half)."""
             params = get_iter_params(iter_idx)
             if params is None:
                 return []
             round_num, i = params
             block = get_block(iter_idx)
-            vtmp_val = val_cache + i  # Use val_cache directly
+            vtmp_val = val_cache + i
             slots = []
-            # # val = myhash(val)
-            for hi in range(6):
+            # First 3 hash stages
+            for hi in range(3):
                 op1, val1, op2, op3, val3 = HASH_STAGES[hi]
                 if op1 == "+" and op2 == "+" and op3 == "<<":
                     factor = 1 + (1 << val3)
-                    slots.append(("valu", ("multiply_add", vtmp_val, vtmp_val, 
+                    slots.append(("valu", ("multiply_add", vtmp_val, vtmp_val,
+                                          self.scratch_vconst(factor), self.scratch_vconst(val1))))
+                else:
+                    slots.append(("valu", (op1, block["vtmp1"], vtmp_val, self.scratch_vconst(val1))))
+                    slots.append(("valu", (op3, block["vtmp2"], vtmp_val, self.scratch_vconst(val3))))
+                    slots.append(("valu", (op2, vtmp_val, block["vtmp1"], block["vtmp2"])))
+            return slots
+
+        def emit_hash_part2(iter_idx):
+            """Hash stages 3-5 + idx_update (second half).
+            
+            Idx update for levels 0, 1, 2 is handled by emit_scalar_idx_update_level012 using ALU.
+            """
+            params = get_iter_params(iter_idx)
+            if params is None:
+                return []
+            round_num, i = params
+            block = get_block(iter_idx)
+            vtmp_idx = idx_cache + i
+            vtmp_val = val_cache + i
+            slots = []
+            # Last 3 hash stages
+            for hi in range(3, 6):
+                op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+                if op1 == "+" and op2 == "+" and op3 == "<<":
+                    factor = 1 + (1 << val3)
+                    slots.append(("valu", ("multiply_add", vtmp_val, vtmp_val,
                                           self.scratch_vconst(factor), self.scratch_vconst(val1))))
                 else:
                     slots.append(("valu", (op1, block["vtmp1"], vtmp_val, self.scratch_vconst(val1))))
@@ -559,94 +694,71 @@ class KernelBuilder:
                     slots.append(("valu", (op2, vtmp_val, block["vtmp1"], block["vtmp2"])))
             if self.enable_debug:
                 slots.append(("debug", ("vcompare", vtmp_val, [(round_num, i+j, "hashed_val") for j in range(VLEN)])))
-            return slots
-        
-        def emit_idx_update(iter_idx):
-            """Index update operations."""
-            params = get_iter_params(iter_idx)
-            if params is None:
-                return []
-            round_num, i = params
-            block = get_block(iter_idx)
-            vtmp_idx = idx_cache + i  # Use idx_cache directly
-            vtmp_val = val_cache + i  # Use val_cache directly
-            slots = []
-            
+
             # Determine current level to optimize idx calculation
+            # Levels 0, 1, 2 idx update is handled by scalar ALU path
             level = round_num % (forest_height + 1)
-            if level == 0:
-                # Level 0: all idx == 0, so idx = 2*0 + 1 + (val & 1) = 1 + (val & 1)
-                slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
-                slots.append(("valu", ("+", vtmp_idx, block["vtmp3"], vone_const)))
-            elif level == 1:
-                # Level 1: idx is 1 or 2, so idx = 2*idx + 1 + (val & 1) = 3/4 or 5/6
-                # Use: idx = 2*(idx-1) + 3 + (val & 1) = 2*idx + 1 + (val & 1)
-                # Simplified: idx = idx * 2 + 1 + (val & 1)
-                slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
-                slots.append(("valu", ("+", block["vtmp3"], block["vtmp3"], vone_const)))
-                slots.append(("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, block["vtmp3"])))
-            elif level < forest_height:
-                # Levels 2 to forest_height-1: no wrap needed (idx < n_nodes guaranteed)
-                # idx = 2*idx + 1 + (val & 1)
-                slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
-                slots.append(("valu", ("+", block["vtmp3"], block["vtmp3"], vone_const)))
-                slots.append(("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, block["vtmp3"])))
-            else:
-                # Level forest_height: need wrap check (idx might overflow)
-                slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
-                slots.append(("valu", ("+", block["vtmp3"], block["vtmp3"], vone_const)))
-                slots.append(("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, block["vtmp3"])))
-                slots.append(("valu", ("<", block["vtmp1"], vtmp_idx, v_n_nodes)))
-                slots.append(("valu", ("*", vtmp_idx, block["vtmp1"], vtmp_idx)))
-            
+            if round_num != rounds - 1 and level > 2:
+                if level < forest_height:
+                    slots.append(("valu", ("&", block["vtmp3"], vtmp_val, vone_const)))
+                    slots.append(("valu", ("+", block["vtmp3"], block["vtmp3"], vone_const)))
+                    slots.append(("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, block["vtmp3"])))
+                else:
+                    slots.append(("valu", ("^", vtmp_idx, vtmp_idx, vtmp_idx)))
+
             if self.enable_debug:
                 slots.append(("debug", ("vcompare", vtmp_idx, [(round_num, i+j, "wrapped_idx") for j in range(VLEN)])))
             return slots
         
-        # Software pipelined execution with 6 stages (global across all rounds)
+        # Software pipelined execution with 5 stages (hash split into 2 parts)
+        # Process 2 iterations per step to give bundler more operations to work with
         n_iters = rounds * (batch_size // VLEN)
-        NUM_STAGES = 6  # Added stage 0 for address pre-computation
-        total_steps = n_iters + NUM_STAGES - 1
-        
+        NUM_STAGES = 5
+        # Compute safe UNROLL based on available parallel blocks
+        # Max UNROLL is NUM_PARALLEL_BLOCKS // 2 to avoid aliasing
+        MAX_UNROLL = self.NUM_PARALLEL_BLOCKS // 2
+        UNROLL = min(MAX_UNROLL, 8)  # Cap at 8 for reasonable code size
+        assert UNROLL >= 1, f"NUM_PARALLEL_BLOCKS ({self.NUM_PARALLEL_BLOCKS}) too small, need at least 2"
+        total_steps = (n_iters + UNROLL - 1) // UNROLL + NUM_STAGES - 1
+
         for step in range(total_steps):
-            # Interleave operations from multiple iterations for better bundling
-            # The bundler will pack independent operations together
+            # Process UNROLL iterations at each pipeline stage
+
+            # Stage 0: Address compute + Load node val
+            for u in range(UNROLL):
+                iter_s0 = step * UNROLL + u
+                if 0 <= iter_s0 < n_iters:
+                    body.extend(emit_stage0_addr_compute(iter_s0))
+                    body.extend(emit_stage1_loads_node_val(iter_s0))
+
+            # Stage 1: XOR
+            # For levels 0, 1, 2, 3: use scalar ALU XOR (8 ops in parallel)
+            # For levels 4+: use VALU XOR
+            for u in range(UNROLL):
+                iter_s1 = (step - 1) * UNROLL + u
+                if 0 <= iter_s1 < n_iters:
+                    body.extend(emit_scalar_xor_level012(iter_s1))
+                    body.extend(emit_stage2_xor(iter_s1))
+
+            # Stage 2: Hash part 1 (stages 0-2)
+            for u in range(UNROLL):
+                iter_s2 = (step - 2) * UNROLL + u
+                if 0 <= iter_s2 < n_iters:
+                    body.extend(emit_hash_part1(iter_s2))
+
+            # Stage 3: Hash part 2 (stages 3-5) + Idx update
+            # For levels 0, 1, 2: idx update uses scalar ALU
+            # For levels 4+: idx update uses VALU
+            for u in range(UNROLL):
+                iter_s3 = (step - 3) * UNROLL + u
+                if 0 <= iter_s3 < n_iters:
+                    body.extend(emit_hash_part2(iter_s3))
+                    body.extend(emit_scalar_idx_update_level012(iter_s3))
             
-            # Stage 0: Pre-compute addresses for scattered loads
-            iter_s0 = step
-            if 0 <= iter_s0 < n_iters:
-                body.extend(emit_stage0_addr_compute(iter_s0))
-            
-            # Stage 1: Load node val (load operations - 2 slots available, most constrained)
-            iter_s1 = step - 1
-            if 0 <= iter_s1 < n_iters:
-                body.extend(emit_stage1_loads_node_val(iter_s1))
-            
-            # Stage 2: XOR (VALU operation - can be bundled with loads)
-            iter_s2 = step - 2
-            if 0 <= iter_s2 < n_iters:
-                body.extend(emit_stage2_xor(iter_s2))
-            
-            # Stage 3: Hash (VALU operations - 6 slots available)
-            iter_s3 = step - 3
-            if 0 <= iter_s3 < n_iters:
-                body.extend(emit_hash(iter_s3))
-            
-            # Stage 4: Idx update (VALU operations - 6 slots available)
-            iter_s4 = step - 4
-            if 0 <= iter_s4 < n_iters:
-                body.extend(emit_idx_update(iter_s4))
-            
-        # Pre-compute all store addresses using ALU (12 slots/cycle) - allows bundling
-        # Reuse offset_consts that were already computed in init
+        # Issue all stores - only val needed for correctness check
+        # Reuse val_addrs (computed in init) since they equal inp_values_p + offset
         for j in range(n_chunks):
-            body.append(("alu", ("+", idx_store_addrs[j], self.scratch["inp_indices_p"], offset_consts[j])))
-            body.append(("alu", ("+", val_store_addrs[j], self.scratch["inp_values_p"], offset_consts[j])))
-        
-        # Issue all stores in parallel (2 per cycle) - no dependencies between iterations
-        for j in range(n_chunks):
-            body.append(("store", ("vstore", idx_store_addrs[j], idx_cache + j * VLEN)))
-            body.append(("store", ("vstore", val_store_addrs[j], val_cache + j * VLEN)))
+            body.append(("store", ("vstore", val_addrs[j], val_cache + j * VLEN)))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
