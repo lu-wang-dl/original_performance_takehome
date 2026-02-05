@@ -128,143 +128,158 @@ class KernelBuilder:
 
         return inputs, outputs, barrier
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Update the logic for slot packing
-        instrs = []
-        used = [False] * len(slots)
-        n = len(slots)
+    def build(self, slots: list[tuple[Engine, tuple]]):
+        """
+        List-scheduling approach: for each slot, compute earliest cycle based on
+        dependencies, then find first cycle with available resources.
+        """
+        schedule = []  # List of dict[engine, list[op]]
+        cycle_counts = []  # Track usage per cycle: index -> dict[engine, count]
 
-        bundle = {}
-        bundle_input = set()
-        bundle_output = set()
+        # Precompute dependency graph using program order (RAW/WAW + barriers)
+        last_write_idx = {}
+        last_barrier_idx = -1
+        slot_meta = []
+        dependents = [[] for _ in slots]
+        dep_count = [0 for _ in slots]
 
-        # Add a flag to enable/disable logging
-        enable_logging = self.enable_bundle_logging
+        for i, (engine, op) in enumerate(slots):
+            inputs, outputs, barrier = self._slot_input_output(engine, op)
+            slot_meta.append(
+                {
+                    "engine": engine,
+                    "op": op,
+                    "inputs": inputs,
+                    "outputs": outputs,
+                    "barrier": barrier,
+                }
+            )
 
-        import os
-        import inspect
+            if last_barrier_idx != -1:
+                dependents[last_barrier_idx].append(i)
+                dep_count[i] += 1
 
-        log_file_path = "bundle_decisions.log"
-        if enable_logging:
-            # Optionally, clear the log before starting (can comment out if desired)
-            with open(log_file_path, "w") as log_file:
-                log_file.write("")  # Clear file before logging
+            if barrier and i > 0:
+                dependents[i - 1].append(i)
+                dep_count[i] += 1
 
-        def log_decision(message):
-            if not enable_logging:
-                return
-            frame = inspect.currentframe().f_back
-            lineno = frame.f_lineno
-            with open(log_file_path, "a") as log_file:
-                log_file.write(f"[line {lineno}] {message}\n")
+            for r in inputs:
+                if r in last_write_idx:
+                    dep = last_write_idx[r]
+                    dependents[dep].append(i)
+                    dep_count[i] += 1
 
-        def flush_bundle():
-            nonlocal bundle, bundle_input, bundle_output
-            if bundle:
-                instrs.append(bundle)
-            log_decision(f"Flush: {bundle}, bundle_input: {bundle_input}, bundle_output: {bundle_output}")
-            bundle = {}
-            bundle_input = set()
-            bundle_output = set()
-        
-        def can_add_to_bundle(engine, slot_inputs, slot_outputs):
-            reason = None
-            if len(bundle.get(engine, [])) >= SLOT_LIMITS[engine]:
-                reason = f"SLOT_LIMIT: engine={engine} has {len(bundle.get(engine, []))} (limit {SLOT_LIMITS[engine]})"
-                log_decision(f"can_add_to_bundle: NO (engine={engine}) - {reason}")
-                return False
-            if slot_inputs & bundle_output:
-                reason = f"RAW hazard: slot_inputs {slot_inputs} & bundle_output {bundle_output} = {slot_inputs & bundle_output}"
-                log_decision(f"can_add_to_bundle: NO (engine={engine}) - {reason}")
-                return False
-            if slot_outputs & bundle_output:
-                reason = f"WAW hazard: slot_outputs {slot_outputs} & bundle_output {bundle_output} = {slot_outputs & bundle_output}"
-                log_decision(f"can_add_to_bundle: NO (engine={engine}) - {reason}")
-                return False
-            log_decision(f"can_add_to_bundle: YES (engine={engine})")
-            return True
-        
-        idx = 0
-        while idx < n:
-            if used[idx]:
-                idx += 1
-                continue
-            engine, slot = slots[idx]
-            slot_inputs, slot_outputs, barrier = self._slot_input_output(engine, slot)
-            log_decision(f"Step idx={idx}, engine={engine}, slot={slot}, barrier={barrier}")
+            for w in outputs:
+                if w in last_write_idx:
+                    dep = last_write_idx[w]
+                    dependents[dep].append(i)
+                    dep_count[i] += 1
+
+            for r in inputs:
+                pass
+            for w in outputs:
+                last_write_idx[w] = i
+
             if barrier:
-                flush_bundle()
-                instrs.append({engine: [slot]})
-                log_decision(f"Barrier at idx={idx}: {engine}, slot={slot} placed in new instr; advancing.")
-                used[idx] = True
-                idx += 1
-                continue
+                last_barrier_idx = i
 
-            if can_add_to_bundle(engine, slot_inputs, slot_outputs):
-                log_decision(f"At idx={idx}, can add: engine={engine}, slot={slot} to current bundle.")
-                bundle.setdefault(engine, []).append(slot)
-                bundle_input.update(slot_inputs)
-                bundle_output.update(slot_outputs)
-                used[idx] = True
-                idx += 1
-            else:
-                log_decision(f"At idx={idx}, cannot add: engine={engine}, slot={slot}. Flushing bundle and starting new bundle with this slot.")
-                flush_bundle()
-                bundle.setdefault(engine, []).append(slot)
-                bundle_input.update(slot_inputs)
-                bundle_output.update(slot_outputs)
-                used[idx] = True
-                idx += 1
+        read_lists = defaultdict(list)
+        for i, meta in enumerate(slot_meta):
+            for r in meta["inputs"]:
+                read_lists[r].append(i)
+        read_pos = {addr: 0 for addr in read_lists}
 
-            # Look ahead: Add slots that do not conflict with the current bundle
-            # Use a more aggressive multi-pass approach to find independent operations
-            skipped_outputs = set()
-            skipped_inputs = set()  # Track what skipped slots read (for WAR hazards)
+        ready = [i for i in range(len(slots)) if dep_count[i] == 0]
+        scheduled = [False for _ in slots]
+        scheduled_count = 0
+        current_cycle = 0
+        min_unscheduled = 0
+
+        last_write_cycle = {}
+
+        engine_priority = {
+            "flow": 0,
+            "load": 1,
+            "store": 2,
+            "valu": 3,
+            "alu": 4,
+            "debug": 5,
+        }
+
+        while scheduled_count < len(slots):
+            while current_cycle >= len(schedule):
+                schedule.append(defaultdict(list))
+                cycle_counts.append(defaultdict(int))
+
+            while min_unscheduled < len(slots) and scheduled[min_unscheduled]:
+                min_unscheduled += 1
+            window_limit = min_unscheduled + self.LOOK_AHEAD_NUMBER
+
+            scheduled_this_cycle = False
             made_progress = True
+
             while made_progress:
                 made_progress = False
-                for look_ahead in range(idx, min(n, idx+self.LOOK_AHEAD_NUMBER)):
-                    if used[look_ahead]:
+                ready_sorted = sorted(
+                    ready, key=lambda i: (engine_priority[slot_meta[i]["engine"]], i)
+                )
+                for idx in ready_sorted:
+                    if idx >= window_limit:
                         continue
-                    look_ahead_engine, look_ahead_slot = slots[look_ahead]
-                    look_ahead_inputs, look_ahead_outputs, look_ahead_barrier = self._slot_input_output(look_ahead_engine, look_ahead_slot)
-                    log_decision(f"  Lookahead {look_ahead}: engine={look_ahead_engine}, slot={look_ahead_slot}")
-                    if look_ahead_barrier:
-                        log_decision(f"  Lookahead {look_ahead}: barrier encountered, breaking lookahead.")
-                        break
-                    # RAW: Can't add if slot reads from a skipped slot's output
-                    if look_ahead_inputs & skipped_outputs:
-                        log_decision(f"  Lookahead {look_ahead}: RAW hazard (inputs {look_ahead_inputs} & skipped_outputs {skipped_outputs}), skipping.")
-                        skipped_outputs.update(look_ahead_outputs)
-                        skipped_inputs.update(look_ahead_inputs)
-                        continue
-                    # WAW: Can't add if slot writes to a skipped slot's output
-                    if look_ahead_outputs & skipped_outputs:
-                        log_decision(f"  Lookahead {look_ahead}: WAW hazard (outputs {look_ahead_outputs} & skipped_outputs {skipped_outputs}), skipping.")
-                        skipped_outputs.update(look_ahead_outputs)
-                        skipped_inputs.update(look_ahead_inputs)
-                        continue
-                    # WAR: Can't add if slot writes to something a skipped slot reads
-                    if look_ahead_outputs & skipped_inputs:
-                        log_decision(f"  Lookahead {look_ahead}: WAR hazard (outputs {look_ahead_outputs} & skipped_inputs {skipped_inputs}), skipping.")
-                        skipped_outputs.update(look_ahead_outputs)
-                        skipped_inputs.update(look_ahead_inputs)
-                        continue
-                    if can_add_to_bundle(look_ahead_engine, look_ahead_inputs, look_ahead_outputs):
-                        log_decision(f"  Lookahead {look_ahead}: can add to bundle: engine={look_ahead_engine}, slot={look_ahead_slot}.")
-                        bundle.setdefault(look_ahead_engine, []).append(look_ahead_slot)
-                        bundle_input.update(look_ahead_inputs)
-                        bundle_output.update(look_ahead_outputs)
-                        used[look_ahead] = True
-                        made_progress = True
-                    else:
-                        log_decision(f"  Lookahead {look_ahead}: cannot add to bundle, updating skipped_outputs (outputs {look_ahead_outputs}).")
-                        skipped_outputs.update(look_ahead_outputs)
-                        skipped_inputs.update(look_ahead_inputs)
+                    meta = slot_meta[idx]
+                    engine = meta["engine"]
+                    inputs = meta["inputs"]
+                    outputs = meta["outputs"]
 
-        flush_bundle()
-        log_decision("Build finished\n")
-        return instrs
+                    start_cycle = 0
+                    for r in inputs:
+                        if r in last_write_cycle:
+                            start_cycle = max(start_cycle, last_write_cycle[r] + 1)
+                    for w in outputs:
+                        if w in last_write_cycle:
+                            start_cycle = max(start_cycle, last_write_cycle[w] + 1)
+
+                    if start_cycle > current_cycle:
+                        continue
+                    if cycle_counts[current_cycle][engine] >= SLOT_LIMITS[engine]:
+                        continue
+                    if any(
+                        read_pos.get(w, 0) < len(read_lists.get(w, []))
+                        and read_lists[w][read_pos[w]] < idx
+                        for w in outputs
+                    ):
+                        continue
+
+                    schedule[current_cycle][engine].append(meta["op"])
+                    cycle_counts[current_cycle][engine] += 1
+
+                    for r in inputs:
+                        if r in read_lists:
+                            pos = read_pos[r]
+                            if pos < len(read_lists[r]) and read_lists[r][pos] == idx:
+                                read_pos[r] = pos + 1
+                    for w in outputs:
+                        last_write_cycle[w] = current_cycle
+
+                    scheduled[idx] = True
+                    scheduled_count += 1
+                    ready.remove(idx)
+                    for dep in dependents[idx]:
+                        dep_count[dep] -= 1
+                        if dep_count[dep] == 0:
+                            ready.append(dep)
+
+                    scheduled_this_cycle = True
+                    made_progress = True
+                    break
+
+            if not scheduled_this_cycle:
+                current_cycle += 1
+                continue
+
+            current_cycle += 1
+
+        return [dict(s) for s in schedule]
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
@@ -345,7 +360,6 @@ class KernelBuilder:
         all_slots.append(("load", ("const", inp_values_p, 7 + n_nodes + batch_size)))
 
         # Vector constants
-        zero_v = self.scratch_vconst(0, "zero_v", all_slots)
         one_v = self.scratch_vconst(1, "one_v", all_slots)
         two_v = self.scratch_vconst(2, "two_v", all_slots)
 
@@ -366,7 +380,7 @@ class KernelBuilder:
 
         # Wavefront scheduling parameters
         K = 32  # Process K batches together
-        PIPE_CHUNK = 32
+        PIPE_CHUNK = 16
         num_vec_batches = batch_size // VLEN
 
         # Allocate scratch for K batch temporaries
@@ -388,13 +402,6 @@ class KernelBuilder:
             v_indices.append(v_idx)
             v_values.append(v_val)
 
-        # Load all batch values into scratch
-        tmp_addr = self.alloc_scratch("tmp_addr")
-        for i in range(batch_size // VLEN):
-            offset = i * VLEN
-            all_slots.append(("alu", ("+", tmp_addr, inp_values_p, self.scratch_const(offset, init_slots=all_slots))))
-            all_slots.append(("load", ("vload", v_values[i], tmp_addr)))
-
         # Pre-cache hash constants
         vv_mul_0 = self.scratch_vconst(4097, init_slots=all_slots)
         vv_add_0 = self.scratch_vconst(HASH_STAGES[0][1], init_slots=all_slots)
@@ -410,22 +417,34 @@ class KernelBuilder:
         vv3_5 = self.scratch_vconst(HASH_STAGES[5][4], init_slots=all_slots)
 
         # Wavefront schedule: process batches at different rounds together
+        tmp_addr = self.alloc_scratch("tmp_addr")
         for i_base in range(0, num_vec_batches, K):
             k_end = min(K, num_vec_batches - i_base)
+            # Load batch values for this block to mix init with early compute
+            for i in range(i_base, i_base + k_end):
+                offset = i * VLEN
+                all_slots.append(("alu", ("+", tmp_addr, inp_values_p, self.scratch_const(offset, init_slots=all_slots))))
+                all_slots.append(("load", ("vload", v_values[i], tmp_addr)))
             for t in range(rounds + k_end - 1):
                 active = []
+                active_last = []
                 for k in range(k_end):
                     r = t - k
                     if 0 <= r < rounds:
-                        active.append((k, r))
+                        if r == rounds - 1:
+                            active_last.append((k, r))
+                        else:
+                            active.append((k, r))
+                active.extend(active_last)
                 if not active:
                     continue
 
-                # Process active batches in chunks
+                # Process active batches in chunks with one-group load/compute overlap
+                prev_group = None
                 for c in range(0, len(active), PIPE_CHUNK):
                     group = active[c : c + PIPE_CHUNK]
 
-                    # 1. Gather node values for this chunk
+                    # 1. Gather node values for current group
                     addr_batches = []
                     for k, r in group:
                         level = r % (forest_height + 1)
@@ -463,8 +482,102 @@ class KernelBuilder:
                         for vi in range(VLEN):
                             all_slots.append(("load", ("load_offset", temps["v_node_vals"], temps["v_tmp1"], vi)))
 
-                    # 2. XOR (val ^ node_val) for this chunk
-                    for k, r in group:
+                    # 2-4. Compute for previous group while current loads are in flight
+                    if prev_group is not None:
+                        # 2. XOR (val ^ node_val)
+                        for k, r in prev_group:
+                            i = i_base + k
+                            level = r % (forest_height + 1)
+                            if level == 0:
+                                all_slots.append(("valu", ("^", v_values[i], v_values[i], v_root_val)))
+                            else:
+                                temps = batch_temps[k]
+                                all_slots.append(("valu", ("^", v_values[i], v_values[i], temps["v_node_vals"])))
+
+                        # 3. Hash stages INTERLEAVED across batches (key optimization!)
+                        # Stage 0: multiply_add for ALL batches
+                        for k, _ in prev_group:
+                            i = i_base + k
+                            all_slots.append(("valu", ("multiply_add", v_values[i], v_values[i], vv_mul_0, vv_add_0)))
+
+                        # Stage 1: (a ^ val1) ^ (a >> 19) - interleaved
+                        for k, _ in prev_group:
+                            i = i_base + k
+                            temps = batch_temps[k]
+                            all_slots.append(("valu", ("^", temps["v_tmp1"], v_values[i], vv1_1)))
+                            all_slots.append(("valu", (">>", temps["v_tmp2"], v_values[i], vv3_1)))
+                        for k, _ in prev_group:
+                            i = i_base + k
+                            temps = batch_temps[k]
+                            all_slots.append(("valu", ("^", v_values[i], temps["v_tmp1"], temps["v_tmp2"])))
+
+                        # Stage 2: multiply_add for ALL batches
+                        for k, _ in prev_group:
+                            i = i_base + k
+                            all_slots.append(("valu", ("multiply_add", v_values[i], v_values[i], vv_mul_2, vv_add_2)))
+
+                        # Stage 3: (a + val1) ^ (a << 9) - interleaved
+                        for k, _ in prev_group:
+                            i = i_base + k
+                            temps = batch_temps[k]
+                            all_slots.append(("valu", ("+", temps["v_tmp1"], v_values[i], vv1_3)))
+                            all_slots.append(("valu", ("<<", temps["v_tmp2"], v_values[i], vv3_3)))
+                        for k, _ in prev_group:
+                            i = i_base + k
+                            temps = batch_temps[k]
+                            all_slots.append(("valu", ("^", v_values[i], temps["v_tmp1"], temps["v_tmp2"])))
+
+                        # Stage 4: multiply_add for ALL batches
+                        for k, _ in prev_group:
+                            i = i_base + k
+                            all_slots.append(("valu", ("multiply_add", v_values[i], v_values[i], vv_mul_4, vv_add_4)))
+
+                        # Stage 5: (a ^ val1) ^ (a >> 16) - interleaved
+                        for k, _ in prev_group:
+                            i = i_base + k
+                            temps = batch_temps[k]
+                            all_slots.append(("valu", ("^", temps["v_tmp1"], v_values[i], vv1_5)))
+                            all_slots.append(("valu", (">>", temps["v_tmp2"], v_values[i], vv3_5)))
+                        for k, _ in prev_group:
+                            i = i_base + k
+                            temps = batch_temps[k]
+                            all_slots.append(("valu", ("^", v_values[i], temps["v_tmp1"], temps["v_tmp2"])))
+
+                        # Store completed batches on final round
+                        for k, r in prev_group:
+                            if r != rounds - 1:
+                                continue
+                            i = i_base + k
+                            offset = i * VLEN
+                            all_slots.append(
+                                ("alu", ("+", tmp_addr, inp_values_p, self.scratch_const(offset, init_slots=all_slots)))
+                            )
+                            all_slots.append(("store", ("vstore", tmp_addr, v_values[i])))
+
+                        # 4. Update indices - interleaved
+                        for k, r in prev_group:
+                            if r == rounds - 1:
+                                continue
+                            i = i_base + k
+                            temps = batch_temps[k]
+                            level = r % (forest_height + 1)
+
+                            if level == forest_height:
+                                # Use XOR to zero (no dependency on zero_v)
+                                all_slots.append(("valu", ("^", v_indices[i], v_indices[i], v_indices[i])))
+                            else:
+                                all_slots.append(("valu", ("&", temps["v_tmp1"], v_values[i], one_v)))
+                                all_slots.append(
+                                    ("valu", ("multiply_add", v_indices[i], v_indices[i], two_v, temps["v_tmp1"]))
+                                )
+
+                    prev_group = group
+
+
+                # Flush last group compute
+                if prev_group is not None:
+                    # 2. XOR (val ^ node_val)
+                    for k, r in prev_group:
                         i = i_base + k
                         level = r % (forest_height + 1)
                         if level == 0:
@@ -475,64 +588,66 @@ class KernelBuilder:
 
                     # 3. Hash stages INTERLEAVED across batches (key optimization!)
                     # Stage 0: multiply_add for ALL batches
-                    for k, _ in group:
+                    for k, _ in prev_group:
                         i = i_base + k
                         all_slots.append(("valu", ("multiply_add", v_values[i], v_values[i], vv_mul_0, vv_add_0)))
 
                     # Stage 1: (a ^ val1) ^ (a >> 19) - interleaved
-                    for k, _ in group:
+                    for k, _ in prev_group:
                         i = i_base + k
                         temps = batch_temps[k]
                         all_slots.append(("valu", ("^", temps["v_tmp1"], v_values[i], vv1_1)))
-                    for k, _ in group:
-                        i = i_base + k
-                        temps = batch_temps[k]
                         all_slots.append(("valu", (">>", temps["v_tmp2"], v_values[i], vv3_1)))
-                    for k, _ in group:
+                    for k, _ in prev_group:
                         i = i_base + k
                         temps = batch_temps[k]
                         all_slots.append(("valu", ("^", v_values[i], temps["v_tmp1"], temps["v_tmp2"])))
 
                     # Stage 2: multiply_add for ALL batches
-                    for k, _ in group:
+                    for k, _ in prev_group:
                         i = i_base + k
                         all_slots.append(("valu", ("multiply_add", v_values[i], v_values[i], vv_mul_2, vv_add_2)))
 
                     # Stage 3: (a + val1) ^ (a << 9) - interleaved
-                    for k, _ in group:
+                    for k, _ in prev_group:
                         i = i_base + k
                         temps = batch_temps[k]
                         all_slots.append(("valu", ("+", temps["v_tmp1"], v_values[i], vv1_3)))
-                    for k, _ in group:
-                        i = i_base + k
-                        temps = batch_temps[k]
                         all_slots.append(("valu", ("<<", temps["v_tmp2"], v_values[i], vv3_3)))
-                    for k, _ in group:
+                    for k, _ in prev_group:
                         i = i_base + k
                         temps = batch_temps[k]
                         all_slots.append(("valu", ("^", v_values[i], temps["v_tmp1"], temps["v_tmp2"])))
 
                     # Stage 4: multiply_add for ALL batches
-                    for k, _ in group:
+                    for k, _ in prev_group:
                         i = i_base + k
                         all_slots.append(("valu", ("multiply_add", v_values[i], v_values[i], vv_mul_4, vv_add_4)))
 
                     # Stage 5: (a ^ val1) ^ (a >> 16) - interleaved
-                    for k, _ in group:
+                    for k, _ in prev_group:
                         i = i_base + k
                         temps = batch_temps[k]
                         all_slots.append(("valu", ("^", temps["v_tmp1"], v_values[i], vv1_5)))
-                    for k, _ in group:
-                        i = i_base + k
-                        temps = batch_temps[k]
                         all_slots.append(("valu", (">>", temps["v_tmp2"], v_values[i], vv3_5)))
-                    for k, _ in group:
+                    for k, _ in prev_group:
                         i = i_base + k
                         temps = batch_temps[k]
                         all_slots.append(("valu", ("^", v_values[i], temps["v_tmp1"], temps["v_tmp2"])))
 
+                    # Store completed batches on final round
+                    for k, r in prev_group:
+                        if r != rounds - 1:
+                            continue
+                        i = i_base + k
+                        offset = i * VLEN
+                        all_slots.append(
+                            ("alu", ("+", tmp_addr, inp_values_p, self.scratch_const(offset, init_slots=all_slots)))
+                        )
+                        all_slots.append(("store", ("vstore", tmp_addr, v_values[i])))
+
                     # 4. Update indices - interleaved
-                    for k, r in group:
+                    for k, r in prev_group:
                         if r == rounds - 1:
                             continue
                         i = i_base + k
@@ -544,22 +659,9 @@ class KernelBuilder:
                             all_slots.append(("valu", ("^", v_indices[i], v_indices[i], v_indices[i])))
                         else:
                             all_slots.append(("valu", ("&", temps["v_tmp1"], v_values[i], one_v)))
-
-                    for k, r in group:
-                        if r == rounds - 1:
-                            continue
-                        level = r % (forest_height + 1)
-                        if level == forest_height:
-                            continue
-                        i = i_base + k
-                        temps = batch_temps[k]
-                        all_slots.append(("valu", ("multiply_add", v_indices[i], v_indices[i], two_v, temps["v_tmp1"])))
-
-        # Store back values
-        for i in range(batch_size // VLEN):
-            offset = i * VLEN
-            all_slots.append(("alu", ("+", tmp_addr, inp_values_p, self.scratch_const(offset, init_slots=all_slots))))
-            all_slots.append(("store", ("vstore", tmp_addr, v_values[i])))
+                            all_slots.append(
+                                ("valu", ("multiply_add", v_indices[i], v_indices[i], two_v, temps["v_tmp1"]))
+                            )
 
         packed_instrs = self.build(all_slots)
         self.instrs.extend(packed_instrs)
