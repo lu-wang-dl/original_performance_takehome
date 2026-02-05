@@ -37,7 +37,7 @@ from problem import (
 )
 
 class KernelBuilder:
-    LOOK_AHEAD_NUMBER = 1000
+    LOOK_AHEAD_NUMBER = 50000
     NUM_PARALLEL_BLOCKS = 17
 
     def __init__(self):
@@ -360,6 +360,7 @@ class KernelBuilder:
         all_slots.append(("load", ("const", inp_values_p, 7 + n_nodes + batch_size)))
 
         # Vector constants
+        zero_v = self.scratch_vconst(0, "zero_v", all_slots)
         one_v = self.scratch_vconst(1, "one_v", all_slots)
         two_v = self.scratch_vconst(2, "two_v", all_slots)
 
@@ -554,7 +555,7 @@ class KernelBuilder:
                             )
                             all_slots.append(("store", ("vstore", tmp_addr, v_values[i])))
 
-                        # 4. Update indices - interleaved
+                        # 4. Update indices - 2-phase
                         for k, r in prev_group:
                             if r == rounds - 1:
                                 continue
@@ -563,13 +564,21 @@ class KernelBuilder:
                             level = r % (forest_height + 1)
 
                             if level == forest_height:
-                                # Use XOR to zero (no dependency on zero_v)
-                                all_slots.append(("valu", ("^", v_indices[i], v_indices[i], v_indices[i])))
+                                all_slots.append(("valu", ("+", v_indices[i], zero_v, zero_v)))
                             else:
                                 all_slots.append(("valu", ("&", temps["v_tmp1"], v_values[i], one_v)))
-                                all_slots.append(
-                                    ("valu", ("multiply_add", v_indices[i], v_indices[i], two_v, temps["v_tmp1"]))
-                                )
+
+                        for k, r in prev_group:
+                            if r == rounds - 1:
+                                continue
+                            level = r % (forest_height + 1)
+                            if level == forest_height:
+                                continue
+                            i = i_base + k
+                            temps = batch_temps[k]
+                            all_slots.append(
+                                ("valu", ("multiply_add", v_indices[i], v_indices[i], two_v, temps["v_tmp1"]))
+                            )
 
                     prev_group = group
 
@@ -646,7 +655,7 @@ class KernelBuilder:
                         )
                         all_slots.append(("store", ("vstore", tmp_addr, v_values[i])))
 
-                    # 4. Update indices - interleaved
+                    # 4. Update indices - 2-phase
                     for k, r in prev_group:
                         if r == rounds - 1:
                             continue
@@ -655,13 +664,21 @@ class KernelBuilder:
                         level = r % (forest_height + 1)
 
                         if level == forest_height:
-                            # Use XOR to zero (no dependency on zero_v)
-                            all_slots.append(("valu", ("^", v_indices[i], v_indices[i], v_indices[i])))
+                            all_slots.append(("valu", ("+", v_indices[i], zero_v, zero_v)))
                         else:
                             all_slots.append(("valu", ("&", temps["v_tmp1"], v_values[i], one_v)))
-                            all_slots.append(
-                                ("valu", ("multiply_add", v_indices[i], v_indices[i], two_v, temps["v_tmp1"]))
-                            )
+
+                    for k, r in prev_group:
+                        if r == rounds - 1:
+                            continue
+                        level = r % (forest_height + 1)
+                        if level == forest_height:
+                            continue
+                        i = i_base + k
+                        temps = batch_temps[k]
+                        all_slots.append(
+                            ("valu", ("multiply_add", v_indices[i], v_indices[i], two_v, temps["v_tmp1"]))
+                        )
 
         packed_instrs = self.build(all_slots)
         self.instrs.extend(packed_instrs)
