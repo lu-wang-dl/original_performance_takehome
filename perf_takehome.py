@@ -37,8 +37,7 @@ from problem import (
 )
 
 class KernelBuilder:
-    LOOK_AHEAD_NUMBER = 1000
-    NUM_PARALLEL_BLOCKS = 17
+    LOOK_AHEAD_NUMBER = 8000
 
     def __init__(self):
         self.instrs = []
@@ -314,35 +313,6 @@ class KernelBuilder:
             self.vconst_map[val] = addr
         return self.vconst_map[val]
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
-
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            if self.enable_debug:
-                slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-
-        return slots
-
-    def build_vhash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
-
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            if op1 == "+" and op2 == "+" and op3 == "<<":
-                # Use multiply_add
-                factor = 1 + (1 << val3)
-                slots.append(("valu", ("multiply_add", val_hash_addr, val_hash_addr, self.scratch_vconst(factor), self.scratch_vconst(val1))))
-            else:
-                slots.append(("valu", (op1, tmp1, val_hash_addr, self.scratch_vconst(val1))))
-                slots.append(("valu", (op3, tmp2, val_hash_addr, self.scratch_vconst(val3))))
-                slots.append(("valu", (op2, val_hash_addr, tmp1, tmp2)))
-            if self.enable_debug:
-                slots.append(("debug", ("vcompare", val_hash_addr, [(round, i+idx, "hash_stage", hi) for idx in range(VLEN)])))
-        
-        return slots
-
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
@@ -360,6 +330,7 @@ class KernelBuilder:
         all_slots.append(("load", ("const", inp_values_p, 7 + n_nodes + batch_size)))
 
         # Vector constants
+        zero_v = self.scratch_vconst(0, "zero_v", all_slots)
         one_v = self.scratch_vconst(1, "one_v", all_slots)
         two_v = self.scratch_vconst(2, "two_v", all_slots)
 
@@ -380,7 +351,8 @@ class KernelBuilder:
 
         # Wavefront scheduling parameters
         K = 32  # Process K batches together
-        PIPE_CHUNK = 16
+        K_HALF = K // 2
+        PIPE_CHUNK = 2
         num_vec_batches = batch_size // VLEN
 
         # Allocate scratch for K batch temporaries
@@ -417,19 +389,14 @@ class KernelBuilder:
         vv3_5 = self.scratch_vconst(HASH_STAGES[5][4], init_slots=all_slots)
 
         # Wavefront schedule: process batches at different rounds together
-        tmp_addr = self.alloc_scratch("tmp_addr")
         for i_base in range(0, num_vec_batches, K):
             k_end = min(K, num_vec_batches - i_base)
-            # Load batch values for this block to mix init with early compute
-            for i in range(i_base, i_base + k_end):
-                offset = i * VLEN
-                all_slots.append(("alu", ("+", tmp_addr, inp_values_p, self.scratch_const(offset, init_slots=all_slots))))
-                all_slots.append(("load", ("vload", v_values[i], tmp_addr)))
-            for t in range(rounds + k_end - 1):
+            loaded = [False] * k_end
+            for t in range(rounds + K_HALF - 1):
                 active = []
                 active_last = []
                 for k in range(k_end):
-                    r = t - k
+                    r = t - (k % K_HALF)
                     if 0 <= r < rounds:
                         if r == rounds - 1:
                             active_last.append((k, r))
@@ -439,13 +406,23 @@ class KernelBuilder:
                 if not active:
                     continue
 
+                # Load batch values right before first use
+                for k, r in active:
+                    if not loaded[k]:
+                        loaded[k] = True
+                        i = i_base + k
+                        offset = i * VLEN
+                        temps = batch_temps[k]
+                        all_slots.append(("alu", ("+", temps["v_tmp1"], inp_values_p, self.scratch_const(offset, init_slots=all_slots))))
+                        all_slots.append(("load", ("vload", v_values[i], temps["v_tmp1"])))
+
                 # Process active batches in chunks with one-group load/compute overlap
+                num_groups = (len(active) + PIPE_CHUNK - 1) // PIPE_CHUNK
                 prev_group = None
-                for c in range(0, len(active), PIPE_CHUNK):
-                    group = active[c : c + PIPE_CHUNK]
+                for g in range(num_groups + 1):
+                    group = active[g * PIPE_CHUNK : g * PIPE_CHUNK + PIPE_CHUNK] if g < num_groups else []
 
                     # 1. Gather node values for current group
-                    addr_batches = []
                     for k, r in group:
                         level = r % (forest_height + 1)
                         i = i_base + k
@@ -470,17 +447,12 @@ class KernelBuilder:
                                 ("flow", ("vselect", temps["v_node_vals"], temps["v_tmp1"], temps["v_tmp2"], temps["v_node_vals"]))
                             )
                         elif level >= 3:
-                            # Use 8 ALU ops for address computation
                             level_base = self.scratch_const(7 + (1 << level) - 1, init_slots=all_slots)
                             for vi in range(VLEN):
                                 v_idx_addr = v_indices[i] + vi
                                 all_slots.append(("alu", ("+", temps["v_tmp1"] + vi, level_base, v_idx_addr)))
-                            addr_batches.append(k)
-
-                    for k in addr_batches:
-                        temps = batch_temps[k]
-                        for vi in range(VLEN):
-                            all_slots.append(("load", ("load_offset", temps["v_node_vals"], temps["v_tmp1"], vi)))
+                            for vi in range(VLEN):
+                                all_slots.append(("load", ("load_offset", temps["v_node_vals"], temps["v_tmp1"], vi)))
 
                     # 2-4. Compute for previous group while current loads are in flight
                     if prev_group is not None:
@@ -549,12 +521,13 @@ class KernelBuilder:
                                 continue
                             i = i_base + k
                             offset = i * VLEN
+                            temps = batch_temps[k]
                             all_slots.append(
-                                ("alu", ("+", tmp_addr, inp_values_p, self.scratch_const(offset, init_slots=all_slots)))
+                                ("alu", ("+", temps["v_tmp1"], inp_values_p, self.scratch_const(offset, init_slots=all_slots)))
                             )
-                            all_slots.append(("store", ("vstore", tmp_addr, v_values[i])))
+                            all_slots.append(("store", ("vstore", temps["v_tmp1"], v_values[i])))
 
-                        # 4. Update indices - interleaved
+                        # 4. Update indices - 2-phase
                         for k, r in prev_group:
                             if r == rounds - 1:
                                 continue
@@ -563,105 +536,22 @@ class KernelBuilder:
                             level = r % (forest_height + 1)
 
                             if level == forest_height:
-                                # Use XOR to zero (no dependency on zero_v)
-                                all_slots.append(("valu", ("^", v_indices[i], v_indices[i], v_indices[i])))
+                                all_slots.append(("valu", ("+", v_indices[i], zero_v, zero_v)))
                             else:
                                 all_slots.append(("valu", ("&", temps["v_tmp1"], v_values[i], one_v)))
-                                all_slots.append(
-                                    ("valu", ("multiply_add", v_indices[i], v_indices[i], two_v, temps["v_tmp1"]))
-                                )
 
-                    prev_group = group
-
-
-                # Flush last group compute
-                if prev_group is not None:
-                    # 2. XOR (val ^ node_val)
-                    for k, r in prev_group:
-                        i = i_base + k
-                        level = r % (forest_height + 1)
-                        if level == 0:
-                            all_slots.append(("valu", ("^", v_values[i], v_values[i], v_root_val)))
-                        else:
+                        for k, r in prev_group:
+                            if r == rounds - 1:
+                                continue
+                            level = r % (forest_height + 1)
+                            if level == forest_height:
+                                continue
+                            i = i_base + k
                             temps = batch_temps[k]
-                            all_slots.append(("valu", ("^", v_values[i], v_values[i], temps["v_node_vals"])))
-
-                    # 3. Hash stages INTERLEAVED across batches (key optimization!)
-                    # Stage 0: multiply_add for ALL batches
-                    for k, _ in prev_group:
-                        i = i_base + k
-                        all_slots.append(("valu", ("multiply_add", v_values[i], v_values[i], vv_mul_0, vv_add_0)))
-
-                    # Stage 1: (a ^ val1) ^ (a >> 19) - interleaved
-                    for k, _ in prev_group:
-                        i = i_base + k
-                        temps = batch_temps[k]
-                        all_slots.append(("valu", ("^", temps["v_tmp1"], v_values[i], vv1_1)))
-                        all_slots.append(("valu", (">>", temps["v_tmp2"], v_values[i], vv3_1)))
-                    for k, _ in prev_group:
-                        i = i_base + k
-                        temps = batch_temps[k]
-                        all_slots.append(("valu", ("^", v_values[i], temps["v_tmp1"], temps["v_tmp2"])))
-
-                    # Stage 2: multiply_add for ALL batches
-                    for k, _ in prev_group:
-                        i = i_base + k
-                        all_slots.append(("valu", ("multiply_add", v_values[i], v_values[i], vv_mul_2, vv_add_2)))
-
-                    # Stage 3: (a + val1) ^ (a << 9) - interleaved
-                    for k, _ in prev_group:
-                        i = i_base + k
-                        temps = batch_temps[k]
-                        all_slots.append(("valu", ("+", temps["v_tmp1"], v_values[i], vv1_3)))
-                        all_slots.append(("valu", ("<<", temps["v_tmp2"], v_values[i], vv3_3)))
-                    for k, _ in prev_group:
-                        i = i_base + k
-                        temps = batch_temps[k]
-                        all_slots.append(("valu", ("^", v_values[i], temps["v_tmp1"], temps["v_tmp2"])))
-
-                    # Stage 4: multiply_add for ALL batches
-                    for k, _ in prev_group:
-                        i = i_base + k
-                        all_slots.append(("valu", ("multiply_add", v_values[i], v_values[i], vv_mul_4, vv_add_4)))
-
-                    # Stage 5: (a ^ val1) ^ (a >> 16) - interleaved
-                    for k, _ in prev_group:
-                        i = i_base + k
-                        temps = batch_temps[k]
-                        all_slots.append(("valu", ("^", temps["v_tmp1"], v_values[i], vv1_5)))
-                        all_slots.append(("valu", (">>", temps["v_tmp2"], v_values[i], vv3_5)))
-                    for k, _ in prev_group:
-                        i = i_base + k
-                        temps = batch_temps[k]
-                        all_slots.append(("valu", ("^", v_values[i], temps["v_tmp1"], temps["v_tmp2"])))
-
-                    # Store completed batches on final round
-                    for k, r in prev_group:
-                        if r != rounds - 1:
-                            continue
-                        i = i_base + k
-                        offset = i * VLEN
-                        all_slots.append(
-                            ("alu", ("+", tmp_addr, inp_values_p, self.scratch_const(offset, init_slots=all_slots)))
-                        )
-                        all_slots.append(("store", ("vstore", tmp_addr, v_values[i])))
-
-                    # 4. Update indices - interleaved
-                    for k, r in prev_group:
-                        if r == rounds - 1:
-                            continue
-                        i = i_base + k
-                        temps = batch_temps[k]
-                        level = r % (forest_height + 1)
-
-                        if level == forest_height:
-                            # Use XOR to zero (no dependency on zero_v)
-                            all_slots.append(("valu", ("^", v_indices[i], v_indices[i], v_indices[i])))
-                        else:
-                            all_slots.append(("valu", ("&", temps["v_tmp1"], v_values[i], one_v)))
                             all_slots.append(
                                 ("valu", ("multiply_add", v_indices[i], v_indices[i], two_v, temps["v_tmp1"]))
                             )
+                    prev_group = group if group else None
 
         packed_instrs = self.build(all_slots)
         self.instrs.extend(packed_instrs)
