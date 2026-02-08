@@ -567,6 +567,18 @@ class KernelBuilder:
         for i in range(4):
             all_slots.append(("valu", ("vbroadcast", v_cache_l2 + i * VLEN, t_preload_vec + 3 + i)))
 
+        # Preload level-3 node values (nodes 7-14, contiguous at mem[14..21])
+        # Reuses t_preload_vec (nodes 0-6 already broadcast above)
+        t_preload_addr2 = self.scratch_const(14, init_slots=all_slots)  # mem[14] = node 7
+        all_slots.append(("load", ("vload", t_preload_vec, t_preload_addr2)))
+        # t_preload_vec[0..7] now holds level-3 node values (nodes 7-14) as scalars
+
+        # Shared scratch for level-3 on-demand broadcast selection
+        v_shared_tmp = self.alloc_scratch("v_shared_tmp", VLEN)   # intermediate vselect results
+        bcast_a = self.alloc_scratch("bcast_a", VLEN)             # broadcast buffer A
+        bcast_b = self.alloc_scratch("bcast_b", VLEN)             # broadcast buffer B
+        scalar_four = self.scratch_const(4, init_slots=all_slots)  # for bit2 extraction
+
         # Wavefront scheduling parameters
         K = 32  # Process K batches together
         K_HALF = K // 2
@@ -664,7 +676,52 @@ class KernelBuilder:
                             all_slots.append(
                                 ("flow", ("vselect", temps["v_node_vals"], temps["v_tmp1"], temps["v_tmp2"], temps["v_node_vals"]))
                             )
-                        elif level >= 3:
+                        elif level == 3:
+                            # Level 3: 8 nodes preloaded in t_preload_vec[0..7] as scalars.
+                            # Use 3-level binary vselect tree with on-demand broadcasting.
+                            # Bit extraction uses scalar ALU to keep VALU free for broadcasts.
+                            scalar_one = self.scratch_const(1, init_slots=all_slots)
+                            scalar_two = self.scratch_const(2, init_slots=all_slots)
+
+                            # Phase A: extract bit0 and bit1 (scalar ALU, 8 ops each)
+                            for vi in range(VLEN):
+                                all_slots.append(("alu", ("&", temps["v_tmp2"] + vi, v_indices[i] + vi, scalar_one)))
+                            for vi in range(VLEN):
+                                all_slots.append(("alu", ("&", temps["v_tmp1"] + vi, v_indices[i] + vi, scalar_two)))
+
+                            # Phase B: Level-0 pair selections using bit0 (in v_tmp2)
+                            # pair01: bit0=1→node1, bit0=0→node0
+                            all_slots.append(("valu", ("vbroadcast", bcast_a, t_preload_vec + 0)))
+                            all_slots.append(("valu", ("vbroadcast", bcast_b, t_preload_vec + 1)))
+                            all_slots.append(("flow", ("vselect", temps["v_node_vals"], temps["v_tmp2"], bcast_b, bcast_a)))
+
+                            # pair23: bit0=1→node3, bit0=0→node2
+                            all_slots.append(("valu", ("vbroadcast", bcast_a, t_preload_vec + 2)))
+                            all_slots.append(("valu", ("vbroadcast", bcast_b, t_preload_vec + 3)))
+                            all_slots.append(("flow", ("vselect", v_shared_tmp, temps["v_tmp2"], bcast_b, bcast_a)))
+
+                            # Phase C: Level-1 quad0123 using bit1 (in v_tmp1)
+                            all_slots.append(("flow", ("vselect", temps["v_node_vals"], temps["v_tmp1"], v_shared_tmp, temps["v_node_vals"])))
+
+                            # pair45: bit0=1→node5, bit0=0→node4
+                            all_slots.append(("valu", ("vbroadcast", bcast_a, t_preload_vec + 4)))
+                            all_slots.append(("valu", ("vbroadcast", bcast_b, t_preload_vec + 5)))
+                            all_slots.append(("flow", ("vselect", v_shared_tmp, temps["v_tmp2"], bcast_b, bcast_a)))
+
+                            # pair67: bit0=1→node7, bit0=0→node6
+                            all_slots.append(("valu", ("vbroadcast", bcast_a, t_preload_vec + 6)))
+                            all_slots.append(("valu", ("vbroadcast", bcast_b, t_preload_vec + 7)))
+                            all_slots.append(("flow", ("vselect", bcast_a, temps["v_tmp2"], bcast_b, bcast_a)))
+
+                            # Phase D: Level-1 quad4567 using bit1
+                            all_slots.append(("flow", ("vselect", bcast_a, temps["v_tmp1"], bcast_a, v_shared_tmp)))
+
+                            # Phase E: Level-2 final selection using bit2
+                            for vi in range(VLEN):
+                                all_slots.append(("alu", ("&", temps["v_tmp1"] + vi, v_indices[i] + vi, scalar_four)))
+                            all_slots.append(("flow", ("vselect", temps["v_node_vals"], temps["v_tmp1"], bcast_a, temps["v_node_vals"])))
+
+                        elif level >= 4:
                             level_base = self.scratch_const(7 + (1 << level) - 1, init_slots=all_slots)
                             for vi in range(VLEN):
                                 v_idx_addr = v_indices[i] + vi
