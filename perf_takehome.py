@@ -280,6 +280,224 @@ class KernelBuilder:
 
         return [dict(s) for s in schedule]
 
+    def build_dependency_forest(self, slots: list[tuple[Engine, tuple]]):
+        """
+        Build a dependency forest from a list of slots.
+
+        For each slot, compute its inputs/outputs via _slot_input_output.
+        If slot j reads a register written by slot i (RAW), or writes a
+        register written by slot i (WAW), or writes a register read by slot i
+        (WAR), then j is added as a child of i.  Barrier instructions also
+        induce edges (all prior slots → barrier, barrier → all subsequent slots
+        until next barrier).
+
+        Returns:
+            nodes: list[dict] – one dict per slot with keys:
+                index, engine, op, inputs, outputs, barrier, children, parents
+            roots: list[int] – indices of slots with no parents (forest roots)
+        """
+        # 1. Compute metadata for every slot
+        nodes = []
+        for i, (engine, op) in enumerate(slots):
+            inputs, outputs, barrier = self._slot_input_output(engine, op)
+            nodes.append({
+                "index": i,
+                "engine": engine,
+                "op": op,
+                "inputs": inputs,
+                "outputs": outputs,
+                "barrier": barrier,
+                "children": [],
+                "parents": [],
+            })
+
+        # 2. Build edges
+        last_write = {}       # scratch addr -> slot index that last wrote it
+        last_read = defaultdict(set)  # scratch addr -> set of slot indices that read since last write
+        last_barrier = -1
+
+        for i, node in enumerate(nodes):
+            deps = set()  # slot indices that i depends on
+
+            # Barrier handling: a barrier depends on all prior slots since the
+            # last barrier, and the next non-barrier slot depends on the barrier.
+            if node["barrier"]:
+                # This barrier depends on everything since last barrier
+                for j in range(max(0, last_barrier + 1) if last_barrier != -1 else 0, i):
+                    deps.add(j)
+            elif last_barrier != -1:
+                # Non-barrier after a barrier: depend on the barrier
+                deps.add(last_barrier)
+
+            # RAW: slot i reads a register that slot j wrote
+            for r in node["inputs"]:
+                if r in last_write:
+                    deps.add(last_write[r])
+
+            # WAW: slot i writes a register that slot j wrote
+            for w in node["outputs"]:
+                if w in last_write:
+                    deps.add(last_write[w])
+
+            # WAR: slot i writes a register that slot j read (anti-dep)
+            for w in node["outputs"]:
+                if w in last_read:
+                    for j in last_read[w]:
+                        if j != i:
+                            deps.add(j)
+
+            # Record edges
+            for dep in deps:
+                nodes[dep]["children"].append(i)
+                node["parents"].append(dep)
+
+            # Update tracking
+            for r in node["inputs"]:
+                last_read[r].add(i)
+            for w in node["outputs"]:
+                last_write[w] = i
+                last_read[w] = set()  # clear readers on new write
+
+            if node["barrier"]:
+                last_barrier = i
+
+        # 3. Identify roots (no parents)
+        roots = [i for i, n in enumerate(nodes) if len(n["parents"]) == 0]
+
+        return nodes, roots
+
+    def build_v2(self, slots: list[tuple[Engine, tuple]]):
+        """
+        List-scheduling approach using build_dependency_forest for the
+        dependency graph.  For each slot, compute earliest cycle based on
+        dependencies, then find first cycle with available resources.
+
+        Uses critical-path length as a scheduling priority: slots with longer
+        chains of dependents are scheduled first to reduce critical-path stalls.
+        """
+        nodes, roots = self.build_dependency_forest(slots)
+
+        schedule = []        # List of dict[engine, list[op]]
+        cycle_counts = []    # index -> dict[engine, count]
+
+        # Derive dependents / dep_count from forest
+        n = len(slots)
+        dependents = [node["children"] for node in nodes]
+        dep_count = [len(node["parents"]) for node in nodes]
+
+        # Compute critical path length for each node (longest chain to leaf).
+        # Process in reverse index order — valid because all edges go from
+        # lower to higher indices.
+        crit_len = [1] * n
+        for i in range(n - 1, -1, -1):
+            if dependents[i]:
+                crit_len[i] = 1 + max(crit_len[c] for c in dependents[i])
+
+        # Build read_lists: for each scratch address, ordered list of slot
+        # indices that read it.  Used to enforce WAR program-order for writes
+        # that alias a still-unread address.
+        read_lists = defaultdict(list)
+        for i, node in enumerate(nodes):
+            for r in node["inputs"]:
+                read_lists[r].append(i)
+        read_pos = {addr: 0 for addr in read_lists}
+
+        ready = list(roots)
+        scheduled = [False] * n
+        scheduled_count = 0
+        current_cycle = 0
+        min_unscheduled = 0
+
+        last_write_cycle = {}
+
+        engine_priority = {
+            "flow": 0,
+            "load": 1,
+            "store": 2,
+            "valu": 3,
+            "alu": 4,
+            "debug": 5,
+        }
+
+        # Precompute sort keys: use engine priority first, then critical path
+        # as a tiebreaker ONLY among slots with similar emission order
+        # (within windows of ~64 slots). This preserves the load/compute
+        # overlap structure while favoring critical-path slots locally.
+        sort_key = [(engine_priority[nodes[i]["engine"]], i // 48, -crit_len[i], i) for i in range(n)]
+
+        while scheduled_count < n:
+            while current_cycle >= len(schedule):
+                schedule.append(defaultdict(list))
+                cycle_counts.append(defaultdict(int))
+
+            while min_unscheduled < n and scheduled[min_unscheduled]:
+                min_unscheduled += 1
+            window_limit = min_unscheduled + self.LOOK_AHEAD_NUMBER
+
+            scheduled_this_cycle = False
+            made_progress = True
+
+            while made_progress:
+                made_progress = False
+                ready_sorted = sorted(ready, key=lambda i: sort_key[i])
+                for idx in ready_sorted:
+                    if idx >= window_limit:
+                        continue
+                    node = nodes[idx]
+                    engine = node["engine"]
+                    inputs = node["inputs"]
+                    outputs = node["outputs"]
+
+                    start_cycle = 0
+                    for r in inputs:
+                        if r in last_write_cycle:
+                            start_cycle = max(start_cycle, last_write_cycle[r] + 1)
+                    for w in outputs:
+                        if w in last_write_cycle:
+                            start_cycle = max(start_cycle, last_write_cycle[w] + 1)
+
+                    if start_cycle > current_cycle:
+                        continue
+                    if cycle_counts[current_cycle][engine] >= SLOT_LIMITS[engine]:
+                        continue
+                    if any(
+                        read_pos.get(w, 0) < len(read_lists.get(w, []))
+                        and read_lists[w][read_pos[w]] < idx
+                        for w in outputs
+                    ):
+                        continue
+
+                    schedule[current_cycle][engine].append(node["op"])
+                    cycle_counts[current_cycle][engine] += 1
+
+                    for r in inputs:
+                        if r in read_lists:
+                            pos = read_pos[r]
+                            if pos < len(read_lists[r]) and read_lists[r][pos] == idx:
+                                read_pos[r] = pos + 1
+                    for w in outputs:
+                        last_write_cycle[w] = current_cycle
+
+                    scheduled[idx] = True
+                    scheduled_count += 1
+                    ready.remove(idx)
+                    for dep in dependents[idx]:
+                        dep_count[dep] -= 1
+                        if dep_count[dep] == 0:
+                            ready.append(dep)
+
+                    scheduled_this_cycle = True
+                    made_progress = True
+                    break
+
+            if not scheduled_this_cycle:
+                current_cycle += 1
+                continue
+
+            current_cycle += 1
+
+        return [dict(s) for s in schedule]
+
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
 
@@ -528,6 +746,11 @@ class KernelBuilder:
                             all_slots.append(("store", ("vstore", temps["v_tmp1"], v_values[i])))
 
                         # 4. Update indices - 2-phase
+                        # Use scalar ALU for bit extraction and index reset
+                        # to offload work from the saturated VALU engine to
+                        # the underutilized ALU engine (12 slots/cycle vs 6).
+                        scalar_zero = self.scratch_const(0, init_slots=all_slots)
+                        scalar_one = self.scratch_const(1, init_slots=all_slots)
                         for k, r in prev_group:
                             if r == rounds - 1:
                                 continue
@@ -536,9 +759,13 @@ class KernelBuilder:
                             level = r % (forest_height + 1)
 
                             if level == forest_height:
-                                all_slots.append(("valu", ("+", v_indices[i], zero_v, zero_v)))
+                                # Index reset: use scalar ALU to zero each element
+                                for vi in range(VLEN):
+                                    all_slots.append(("alu", ("+", v_indices[i] + vi, scalar_zero, scalar_zero)))
                             else:
-                                all_slots.append(("valu", ("&", temps["v_tmp1"], v_values[i], one_v)))
+                                # Bit extraction: use scalar ALU for val & 1
+                                for vi in range(VLEN):
+                                    all_slots.append(("alu", ("&", temps["v_tmp1"] + vi, v_values[i] + vi, scalar_one)))
 
                         for k, r in prev_group:
                             if r == rounds - 1:
@@ -553,7 +780,7 @@ class KernelBuilder:
                             )
                     prev_group = group if group else None
 
-        packed_instrs = self.build(all_slots)
+        packed_instrs = self.build_v2(all_slots)
         self.instrs.extend(packed_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
