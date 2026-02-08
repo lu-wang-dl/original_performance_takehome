@@ -135,8 +135,9 @@ class KernelBuilder:
         schedule = []  # List of dict[engine, list[op]]
         cycle_counts = []  # Track usage per cycle: index -> dict[engine, count]
 
-        # Precompute dependency graph using program order (RAW/WAW + barriers)
+        # Precompute dependency graph using program order (RAW/WAW/WAR + barriers)
         last_write_idx = {}
+        last_read_idx = {}
         last_barrier_idx = -1
         slot_meta = []
         dependents = [[] for _ in slots]
@@ -154,39 +155,39 @@ class KernelBuilder:
                 }
             )
 
+            deps_for_i = set()
+
             if last_barrier_idx != -1:
-                dependents[last_barrier_idx].append(i)
-                dep_count[i] += 1
+                deps_for_i.add(last_barrier_idx)
 
             if barrier and i > 0:
-                dependents[i - 1].append(i)
-                dep_count[i] += 1
+                deps_for_i.add(i - 1)
 
+            # RAW: read depends on last write
             for r in inputs:
                 if r in last_write_idx:
-                    dep = last_write_idx[r]
-                    dependents[dep].append(i)
-                    dep_count[i] += 1
+                    deps_for_i.add(last_write_idx[r])
 
+            # WAW: write depends on last write
             for w in outputs:
                 if w in last_write_idx:
-                    dep = last_write_idx[w]
-                    dependents[dep].append(i)
-                    dep_count[i] += 1
+                    deps_for_i.add(last_write_idx[w])
 
-            for r in inputs:
-                pass
+            # WAR: write depends on last read
+            for w in outputs:
+                if w in last_read_idx:
+                    deps_for_i.add(last_read_idx[w])
+
+            for dep in deps_for_i:
+                dependents[dep].append(i)
+                dep_count[i] += 1
             for w in outputs:
                 last_write_idx[w] = i
+            for r in inputs:
+                last_read_idx[r] = i
 
             if barrier:
                 last_barrier_idx = i
-
-        read_lists = defaultdict(list)
-        for i, meta in enumerate(slot_meta):
-            for r in meta["inputs"]:
-                read_lists[r].append(i)
-        read_pos = {addr: 0 for addr in read_lists}
 
         ready = [i for i in range(len(slots)) if dep_count[i] == 0]
         scheduled = [False for _ in slots]
@@ -223,6 +224,8 @@ class KernelBuilder:
                     ready, key=lambda i: (engine_priority[slot_meta[i]["engine"]], i)
                 )
                 for idx in ready_sorted:
+                    if scheduled[idx]:
+                        continue
                     if idx >= window_limit:
                         continue
                     meta = slot_meta[idx]
@@ -242,21 +245,10 @@ class KernelBuilder:
                         continue
                     if cycle_counts[current_cycle][engine] >= SLOT_LIMITS[engine]:
                         continue
-                    if any(
-                        read_pos.get(w, 0) < len(read_lists.get(w, []))
-                        and read_lists[w][read_pos[w]] < idx
-                        for w in outputs
-                    ):
-                        continue
 
                     schedule[current_cycle][engine].append(meta["op"])
                     cycle_counts[current_cycle][engine] += 1
 
-                    for r in inputs:
-                        if r in read_lists:
-                            pos = read_pos[r]
-                            if pos < len(read_lists[r]) and read_lists[r][pos] == idx:
-                                read_pos[r] = pos + 1
                     for w in outputs:
                         last_write_cycle[w] = current_cycle
 
@@ -270,225 +262,6 @@ class KernelBuilder:
 
                     scheduled_this_cycle = True
                     made_progress = True
-                    break
-
-            if not scheduled_this_cycle:
-                current_cycle += 1
-                continue
-
-            current_cycle += 1
-
-        return [dict(s) for s in schedule]
-
-    def build_dependency_forest(self, slots: list[tuple[Engine, tuple]]):
-        """
-        Build a dependency forest from a list of slots.
-
-        For each slot, compute its inputs/outputs via _slot_input_output.
-        If slot j reads a register written by slot i (RAW), or writes a
-        register written by slot i (WAW), or writes a register read by slot i
-        (WAR), then j is added as a child of i.  Barrier instructions also
-        induce edges (all prior slots → barrier, barrier → all subsequent slots
-        until next barrier).
-
-        Returns:
-            nodes: list[dict] – one dict per slot with keys:
-                index, engine, op, inputs, outputs, barrier, children, parents
-            roots: list[int] – indices of slots with no parents (forest roots)
-        """
-        # 1. Compute metadata for every slot
-        nodes = []
-        for i, (engine, op) in enumerate(slots):
-            inputs, outputs, barrier = self._slot_input_output(engine, op)
-            nodes.append({
-                "index": i,
-                "engine": engine,
-                "op": op,
-                "inputs": inputs,
-                "outputs": outputs,
-                "barrier": barrier,
-                "children": [],
-                "parents": [],
-            })
-
-        # 2. Build edges
-        last_write = {}       # scratch addr -> slot index that last wrote it
-        last_read = defaultdict(set)  # scratch addr -> set of slot indices that read since last write
-        last_barrier = -1
-
-        for i, node in enumerate(nodes):
-            deps = set()  # slot indices that i depends on
-
-            # Barrier handling: a barrier depends on all prior slots since the
-            # last barrier, and the next non-barrier slot depends on the barrier.
-            if node["barrier"]:
-                # This barrier depends on everything since last barrier
-                for j in range(max(0, last_barrier + 1) if last_barrier != -1 else 0, i):
-                    deps.add(j)
-            elif last_barrier != -1:
-                # Non-barrier after a barrier: depend on the barrier
-                deps.add(last_barrier)
-
-            # RAW: slot i reads a register that slot j wrote
-            for r in node["inputs"]:
-                if r in last_write:
-                    deps.add(last_write[r])
-
-            # WAW: slot i writes a register that slot j wrote
-            for w in node["outputs"]:
-                if w in last_write:
-                    deps.add(last_write[w])
-
-            # WAR: slot i writes a register that slot j read (anti-dep)
-            for w in node["outputs"]:
-                if w in last_read:
-                    for j in last_read[w]:
-                        if j != i:
-                            deps.add(j)
-
-            # Record edges
-            for dep in deps:
-                nodes[dep]["children"].append(i)
-                node["parents"].append(dep)
-
-            # Update tracking
-            for r in node["inputs"]:
-                last_read[r].add(i)
-            for w in node["outputs"]:
-                last_write[w] = i
-                last_read[w] = set()  # clear readers on new write
-
-            if node["barrier"]:
-                last_barrier = i
-
-        # 3. Identify roots (no parents)
-        roots = [i for i, n in enumerate(nodes) if len(n["parents"]) == 0]
-
-        return nodes, roots
-
-    def build_v2(self, slots: list[tuple[Engine, tuple]]):
-        """
-        List-scheduling approach using build_dependency_forest for the
-        dependency graph.  For each slot, compute earliest cycle based on
-        dependencies, then find first cycle with available resources.
-
-        Uses critical-path length as a scheduling priority: slots with longer
-        chains of dependents are scheduled first to reduce critical-path stalls.
-        """
-        nodes, roots = self.build_dependency_forest(slots)
-
-        schedule = []        # List of dict[engine, list[op]]
-        cycle_counts = []    # index -> dict[engine, count]
-
-        # Derive dependents / dep_count from forest
-        n = len(slots)
-        dependents = [node["children"] for node in nodes]
-        dep_count = [len(node["parents"]) for node in nodes]
-
-        # Compute critical path length for each node (longest chain to leaf).
-        # Process in reverse index order — valid because all edges go from
-        # lower to higher indices.
-        crit_len = [1] * n
-        for i in range(n - 1, -1, -1):
-            if dependents[i]:
-                crit_len[i] = 1 + max(crit_len[c] for c in dependents[i])
-
-        # Build read_lists: for each scratch address, ordered list of slot
-        # indices that read it.  Used to enforce WAR program-order for writes
-        # that alias a still-unread address.
-        read_lists = defaultdict(list)
-        for i, node in enumerate(nodes):
-            for r in node["inputs"]:
-                read_lists[r].append(i)
-        read_pos = {addr: 0 for addr in read_lists}
-
-        ready = list(roots)
-        scheduled = [False] * n
-        scheduled_count = 0
-        current_cycle = 0
-        min_unscheduled = 0
-
-        last_write_cycle = {}
-
-        engine_priority = {
-            "flow": 0,
-            "load": 1,
-            "store": 2,
-            "valu": 3,
-            "alu": 4,
-            "debug": 5,
-        }
-
-        # Precompute sort keys: use engine priority first, then critical path
-        # as a tiebreaker ONLY among slots with similar emission order
-        # (within windows of ~64 slots). This preserves the load/compute
-        # overlap structure while favoring critical-path slots locally.
-        sort_key = [(engine_priority[nodes[i]["engine"]], i // 48, -crit_len[i], i) for i in range(n)]
-
-        while scheduled_count < n:
-            while current_cycle >= len(schedule):
-                schedule.append(defaultdict(list))
-                cycle_counts.append(defaultdict(int))
-
-            while min_unscheduled < n and scheduled[min_unscheduled]:
-                min_unscheduled += 1
-            window_limit = min_unscheduled + self.LOOK_AHEAD_NUMBER
-
-            scheduled_this_cycle = False
-            made_progress = True
-
-            while made_progress:
-                made_progress = False
-                ready_sorted = sorted(ready, key=lambda i: sort_key[i])
-                for idx in ready_sorted:
-                    if idx >= window_limit:
-                        continue
-                    node = nodes[idx]
-                    engine = node["engine"]
-                    inputs = node["inputs"]
-                    outputs = node["outputs"]
-
-                    start_cycle = 0
-                    for r in inputs:
-                        if r in last_write_cycle:
-                            start_cycle = max(start_cycle, last_write_cycle[r] + 1)
-                    for w in outputs:
-                        if w in last_write_cycle:
-                            start_cycle = max(start_cycle, last_write_cycle[w] + 1)
-
-                    if start_cycle > current_cycle:
-                        continue
-                    if cycle_counts[current_cycle][engine] >= SLOT_LIMITS[engine]:
-                        continue
-                    if any(
-                        read_pos.get(w, 0) < len(read_lists.get(w, []))
-                        and read_lists[w][read_pos[w]] < idx
-                        for w in outputs
-                    ):
-                        continue
-
-                    schedule[current_cycle][engine].append(node["op"])
-                    cycle_counts[current_cycle][engine] += 1
-
-                    for r in inputs:
-                        if r in read_lists:
-                            pos = read_pos[r]
-                            if pos < len(read_lists[r]) and read_lists[r][pos] == idx:
-                                read_pos[r] = pos + 1
-                    for w in outputs:
-                        last_write_cycle[w] = current_cycle
-
-                    scheduled[idx] = True
-                    scheduled_count += 1
-                    ready.remove(idx)
-                    for dep in dependents[idx]:
-                        dep_count[dep] -= 1
-                        if dep_count[dep] == 0:
-                            ready.append(dep)
-
-                    scheduled_this_cycle = True
-                    made_progress = True
-                    break
 
             if not scheduled_this_cycle:
                 current_cycle += 1
@@ -548,7 +321,6 @@ class KernelBuilder:
         all_slots.append(("load", ("const", inp_values_p, 7 + n_nodes + batch_size)))
 
         # Vector constants
-        zero_v = self.scratch_vconst(0, "zero_v", all_slots)
         one_v = self.scratch_vconst(1, "one_v", all_slots)
         two_v = self.scratch_vconst(2, "two_v", all_slots)
 
@@ -567,27 +339,25 @@ class KernelBuilder:
         for i in range(4):
             all_slots.append(("valu", ("vbroadcast", v_cache_l2 + i * VLEN, t_preload_vec + 3 + i)))
 
-        # Preload level-3 node values (nodes 7-14, contiguous at mem[14..21])
-        # Reuses t_preload_vec (nodes 0-6 already broadcast above)
-        t_preload_addr2 = self.scratch_const(14, init_slots=all_slots)  # mem[14] = node 7
-        all_slots.append(("load", ("vload", t_preload_vec, t_preload_addr2)))
-        # t_preload_vec[0..7] now holds level-3 node values (nodes 7-14) as scalars
-
-        # Shared scratch for level-3 on-demand broadcast selection
-        v_shared_tmp = self.alloc_scratch("v_shared_tmp", VLEN)   # intermediate vselect results
-        bcast_a = self.alloc_scratch("bcast_a", VLEN)             # broadcast buffer A
-        bcast_b = self.alloc_scratch("bcast_b", VLEN)             # broadcast buffer B
-        scalar_four = self.scratch_const(4, init_slots=all_slots)  # for bit2 extraction
+        # L3 cache: 8 nodes at level 3 (tree positions 7-14)
+        v_cache_l3 = self.alloc_scratch("v_cache_l3", 8 * VLEN)
+        l3_load_addr = t_preload_vec  # Reuse as temp scalar for address
+        all_slots.append(("flow", ("add_imm", l3_load_addr, forest_values_p, 7)))
+        all_slots.append(("load", ("vload", t_preload_vec, l3_load_addr)))
+        for j in range(8):
+            all_slots.append(("valu", ("vbroadcast", v_cache_l3 + j * VLEN, t_preload_vec + j)))
+        v_tmp_l3 = t_preload_vec  # Shared 4th vector temp for L3 mux (free after init)
 
         # Wavefront scheduling parameters
         K = 32  # Process K batches together
-        K_HALF = K // 2
-        PIPE_CHUNK = 2
+        K_HALF = K // 2  # Interleave two halves
+        PIPE_CHUNK = 1
         num_vec_batches = batch_size // VLEN
+        NUM_TEMP_SETS = K
 
         # Allocate scratch for K batch temporaries
         batch_temps = []
-        for k in range(K):
+        for k in range(NUM_TEMP_SETS):
             temps = {
                 "v_tmp1": self.alloc_scratch(f"v_tmp1_{k}", VLEN),
                 "v_tmp2": self.alloc_scratch(f"v_tmp2_{k}", VLEN),
@@ -618,10 +388,29 @@ class KernelBuilder:
         vv1_5 = self.scratch_vconst(HASH_STAGES[5][1], init_slots=all_slots)
         vv3_5 = self.scratch_vconst(HASH_STAGES[5][4], init_slots=all_slots)
 
+        # Scalar constants for bit extraction in L3 mux
+        const_1 = self.const_map[1]
+        const_2 = self.const_map[2]
+        const_4 = self.scratch_const(4, init_slots=all_slots)
+
+        # Pre-compute level base constants as const loads
+        level_bases = {}
+        for level in range(4, forest_height + 1):
+            addr = self.alloc_scratch(f"level_base_{level}")
+            all_slots.append(("load", ("const", addr, 2 ** level + 6)))
+            level_bases[level] = addr
+
         # Wavefront schedule: process batches at different rounds together
         for i_base in range(0, num_vec_batches, K):
             k_end = min(K, num_vec_batches - i_base)
-            loaded = [False] * k_end
+
+            # Load ALL batch values upfront (before wavefront)
+            for k in range(k_end):
+                i = i_base + k
+                jit_addr = batch_temps[k % NUM_TEMP_SETS]["v_tmp1"]
+                all_slots.append(("flow", ("add_imm", jit_addr, inp_values_p, i * VLEN)))
+                all_slots.append(("load", ("vload", v_values[i], jit_addr)))
+
             for t in range(rounds + K_HALF - 1):
                 active = []
                 active_last = []
@@ -636,27 +425,18 @@ class KernelBuilder:
                 if not active:
                     continue
 
-                # Load batch values right before first use
-                for k, r in active:
-                    if not loaded[k]:
-                        loaded[k] = True
-                        i = i_base + k
-                        offset = i * VLEN
-                        temps = batch_temps[k]
-                        all_slots.append(("alu", ("+", temps["v_tmp1"], inp_values_p, self.scratch_const(offset, init_slots=all_slots))))
-                        all_slots.append(("load", ("vload", v_values[i], temps["v_tmp1"])))
-
-                # Process active batches in chunks with one-group load/compute overlap
+                # Process active batches in chunks: pipeline gather(current) with compute(prev)
                 num_groups = (len(active) + PIPE_CHUNK - 1) // PIPE_CHUNK
                 prev_group = None
+
                 for g in range(num_groups + 1):
                     group = active[g * PIPE_CHUNK : g * PIPE_CHUNK + PIPE_CHUNK] if g < num_groups else []
 
-                    # 1. Gather node values for current group
+                    # --- Gather for current group (FIRST) ---
                     for k, r in group:
                         level = r % (forest_height + 1)
                         i = i_base + k
-                        temps = batch_temps[k]
+                        temps = batch_temps[k % NUM_TEMP_SETS]
 
                         if level == 0:
                             pass  # XOR directly with v_root_val
@@ -665,8 +445,10 @@ class KernelBuilder:
                                 ("flow", ("vselect", temps["v_node_vals"], v_indices[i], v_node_val_2, v_node_val_1))
                             )
                         elif level == 2:
-                            all_slots.append(("valu", ("&", temps["v_tmp2"], v_indices[i], one_v)))
-                            all_slots.append(("valu", ("&", temps["v_tmp1"], v_indices[i], two_v)))
+                            for vi in range(VLEN):
+                                all_slots.append(("alu", ("&", temps["v_tmp2"] + vi, v_indices[i] + vi, const_1)))
+                            for vi in range(VLEN):
+                                all_slots.append(("alu", ("&", temps["v_tmp1"] + vi, v_indices[i] + vi, const_2)))
                             all_slots.append(
                                 ("flow", ("vselect", temps["v_node_vals"], temps["v_tmp2"], v_cache_l2 + 1 * VLEN, v_cache_l2 + 0 * VLEN))
                             )
@@ -677,117 +459,85 @@ class KernelBuilder:
                                 ("flow", ("vselect", temps["v_node_vals"], temps["v_tmp1"], temps["v_tmp2"], temps["v_node_vals"]))
                             )
                         elif level == 3:
-                            # Level 3: 8 nodes preloaded in t_preload_vec[0..7] as scalars.
-                            # Use 3-level binary vselect tree with on-demand broadcasting.
-                            # Bit extraction uses scalar ALU to keep VALU free for broadcasts.
-                            scalar_one = self.scratch_const(1, init_slots=all_slots)
-                            scalar_two = self.scratch_const(2, init_slots=all_slots)
-
-                            # Phase A: extract bit0 and bit1 (scalar ALU, 8 ops each)
+                            D = v_tmp_l3
+                            A = temps["v_tmp1"]
+                            B = temps["v_tmp2"]
+                            C = temps["v_node_vals"]
                             for vi in range(VLEN):
-                                all_slots.append(("alu", ("&", temps["v_tmp2"] + vi, v_indices[i] + vi, scalar_one)))
+                                all_slots.append(("alu", ("&", D + vi, v_indices[i] + vi, const_1)))
                             for vi in range(VLEN):
-                                all_slots.append(("alu", ("&", temps["v_tmp1"] + vi, v_indices[i] + vi, scalar_two)))
-
-                            # Phase B: Level-0 pair selections using bit0 (in v_tmp2)
-                            # pair01: bit0=1→node1, bit0=0→node0
-                            all_slots.append(("valu", ("vbroadcast", bcast_a, t_preload_vec + 0)))
-                            all_slots.append(("valu", ("vbroadcast", bcast_b, t_preload_vec + 1)))
-                            all_slots.append(("flow", ("vselect", temps["v_node_vals"], temps["v_tmp2"], bcast_b, bcast_a)))
-
-                            # pair23: bit0=1→node3, bit0=0→node2
-                            all_slots.append(("valu", ("vbroadcast", bcast_a, t_preload_vec + 2)))
-                            all_slots.append(("valu", ("vbroadcast", bcast_b, t_preload_vec + 3)))
-                            all_slots.append(("flow", ("vselect", v_shared_tmp, temps["v_tmp2"], bcast_b, bcast_a)))
-
-                            # Phase C: Level-1 quad0123 using bit1 (in v_tmp1)
-                            all_slots.append(("flow", ("vselect", temps["v_node_vals"], temps["v_tmp1"], v_shared_tmp, temps["v_node_vals"])))
-
-                            # pair45: bit0=1→node5, bit0=0→node4
-                            all_slots.append(("valu", ("vbroadcast", bcast_a, t_preload_vec + 4)))
-                            all_slots.append(("valu", ("vbroadcast", bcast_b, t_preload_vec + 5)))
-                            all_slots.append(("flow", ("vselect", v_shared_tmp, temps["v_tmp2"], bcast_b, bcast_a)))
-
-                            # pair67: bit0=1→node7, bit0=0→node6
-                            all_slots.append(("valu", ("vbroadcast", bcast_a, t_preload_vec + 6)))
-                            all_slots.append(("valu", ("vbroadcast", bcast_b, t_preload_vec + 7)))
-                            all_slots.append(("flow", ("vselect", bcast_a, temps["v_tmp2"], bcast_b, bcast_a)))
-
-                            # Phase D: Level-1 quad4567 using bit1
-                            all_slots.append(("flow", ("vselect", bcast_a, temps["v_tmp1"], bcast_a, v_shared_tmp)))
-
-                            # Phase E: Level-2 final selection using bit2
+                                all_slots.append(("alu", ("&", B + vi, v_indices[i] + vi, const_2)))
+                            all_slots.append(("flow", ("vselect", C, D, v_cache_l3 + 1 * VLEN, v_cache_l3 + 0 * VLEN)))
+                            all_slots.append(("flow", ("vselect", A, D, v_cache_l3 + 3 * VLEN, v_cache_l3 + 2 * VLEN)))
+                            all_slots.append(("flow", ("vselect", C, B, A, C)))
+                            all_slots.append(("flow", ("vselect", A, D, v_cache_l3 + 5 * VLEN, v_cache_l3 + 4 * VLEN)))
+                            all_slots.append(("flow", ("vselect", D, D, v_cache_l3 + 7 * VLEN, v_cache_l3 + 6 * VLEN)))
+                            all_slots.append(("flow", ("vselect", A, B, D, A)))
                             for vi in range(VLEN):
-                                all_slots.append(("alu", ("&", temps["v_tmp1"] + vi, v_indices[i] + vi, scalar_four)))
-                            all_slots.append(("flow", ("vselect", temps["v_node_vals"], temps["v_tmp1"], bcast_a, temps["v_node_vals"])))
-
+                                all_slots.append(("alu", ("&", B + vi, v_indices[i] + vi, const_4)))
+                            all_slots.append(("flow", ("vselect", C, B, A, C)))
                         elif level >= 4:
-                            level_base = self.scratch_const(7 + (1 << level) - 1, init_slots=all_slots)
+                            level_base = level_bases[level]
                             for vi in range(VLEN):
                                 v_idx_addr = v_indices[i] + vi
                                 all_slots.append(("alu", ("+", temps["v_tmp1"] + vi, level_base, v_idx_addr)))
                             for vi in range(VLEN):
                                 all_slots.append(("load", ("load_offset", temps["v_node_vals"], temps["v_tmp1"], vi)))
 
-                    # 2-4. Compute for previous group while current loads are in flight
+                    # --- Compute for previous group (SECOND) ---
                     if prev_group is not None:
-                        # 2. XOR (val ^ node_val)
                         for k, r in prev_group:
                             i = i_base + k
                             level = r % (forest_height + 1)
                             if level == 0:
-                                all_slots.append(("valu", ("^", v_values[i], v_values[i], v_root_val)))
+                                for vi in range(VLEN):
+                                    all_slots.append(("alu", ("^", v_values[i] + vi, v_values[i] + vi, v_root_val + vi)))
                             else:
-                                temps = batch_temps[k]
-                                all_slots.append(("valu", ("^", v_values[i], v_values[i], temps["v_node_vals"])))
+                                temps = batch_temps[k % NUM_TEMP_SETS]
+                                for vi in range(VLEN):
+                                    all_slots.append(("alu", ("^", v_values[i] + vi, v_values[i] + vi, temps["v_node_vals"] + vi)))
 
-                        # 3. Hash stages INTERLEAVED across batches (key optimization!)
-                        # Stage 0: multiply_add for ALL batches
+                        # Hash stages INTERLEAVED across prev_group batches
                         for k, _ in prev_group:
                             i = i_base + k
                             all_slots.append(("valu", ("multiply_add", v_values[i], v_values[i], vv_mul_0, vv_add_0)))
 
-                        # Stage 1: (a ^ val1) ^ (a >> 19) - interleaved
                         for k, _ in prev_group:
                             i = i_base + k
-                            temps = batch_temps[k]
+                            temps = batch_temps[k % NUM_TEMP_SETS]
                             all_slots.append(("valu", ("^", temps["v_tmp1"], v_values[i], vv1_1)))
                             all_slots.append(("valu", (">>", temps["v_tmp2"], v_values[i], vv3_1)))
                         for k, _ in prev_group:
                             i = i_base + k
-                            temps = batch_temps[k]
+                            temps = batch_temps[k % NUM_TEMP_SETS]
                             all_slots.append(("valu", ("^", v_values[i], temps["v_tmp1"], temps["v_tmp2"])))
 
-                        # Stage 2: multiply_add for ALL batches
                         for k, _ in prev_group:
                             i = i_base + k
                             all_slots.append(("valu", ("multiply_add", v_values[i], v_values[i], vv_mul_2, vv_add_2)))
 
-                        # Stage 3: (a + val1) ^ (a << 9) - interleaved
                         for k, _ in prev_group:
                             i = i_base + k
-                            temps = batch_temps[k]
+                            temps = batch_temps[k % NUM_TEMP_SETS]
                             all_slots.append(("valu", ("+", temps["v_tmp1"], v_values[i], vv1_3)))
                             all_slots.append(("valu", ("<<", temps["v_tmp2"], v_values[i], vv3_3)))
                         for k, _ in prev_group:
                             i = i_base + k
-                            temps = batch_temps[k]
+                            temps = batch_temps[k % NUM_TEMP_SETS]
                             all_slots.append(("valu", ("^", v_values[i], temps["v_tmp1"], temps["v_tmp2"])))
 
-                        # Stage 4: multiply_add for ALL batches
                         for k, _ in prev_group:
                             i = i_base + k
                             all_slots.append(("valu", ("multiply_add", v_values[i], v_values[i], vv_mul_4, vv_add_4)))
 
-                        # Stage 5: (a ^ val1) ^ (a >> 16) - interleaved
                         for k, _ in prev_group:
                             i = i_base + k
-                            temps = batch_temps[k]
+                            temps = batch_temps[k % NUM_TEMP_SETS]
                             all_slots.append(("valu", ("^", temps["v_tmp1"], v_values[i], vv1_5)))
                             all_slots.append(("valu", (">>", temps["v_tmp2"], v_values[i], vv3_5)))
                         for k, _ in prev_group:
                             i = i_base + k
-                            temps = batch_temps[k]
+                            temps = batch_temps[k % NUM_TEMP_SETS]
                             all_slots.append(("valu", ("^", v_values[i], temps["v_tmp1"], temps["v_tmp2"])))
 
                         # Store completed batches on final round
@@ -795,49 +545,31 @@ class KernelBuilder:
                             if r != rounds - 1:
                                 continue
                             i = i_base + k
-                            offset = i * VLEN
-                            temps = batch_temps[k]
-                            all_slots.append(
-                                ("alu", ("+", temps["v_tmp1"], inp_values_p, self.scratch_const(offset, init_slots=all_slots)))
-                            )
-                            all_slots.append(("store", ("vstore", temps["v_tmp1"], v_values[i])))
+                            temps_s = batch_temps[k % NUM_TEMP_SETS]
+                            all_slots.append(("flow", ("add_imm", temps_s["v_tmp1"], inp_values_p, i * VLEN)))
+                            all_slots.append(("store", ("vstore", temps_s["v_tmp1"], v_values[i])))
 
-                        # 4. Update indices - 2-phase
-                        # Use scalar ALU for bit extraction and index reset
-                        # to offload work from the saturated VALU engine to
-                        # the underutilized ALU engine (12 slots/cycle vs 6).
-                        scalar_zero = self.scratch_const(0, init_slots=all_slots)
-                        scalar_one = self.scratch_const(1, init_slots=all_slots)
+                        # Update indices
                         for k, r in prev_group:
                             if r == rounds - 1:
                                 continue
                             i = i_base + k
-                            temps = batch_temps[k]
+                            temps = batch_temps[k % NUM_TEMP_SETS]
                             level = r % (forest_height + 1)
 
                             if level == forest_height:
-                                # Index reset: use scalar ALU to zero each element
                                 for vi in range(VLEN):
-                                    all_slots.append(("alu", ("+", v_indices[i] + vi, scalar_zero, scalar_zero)))
+                                    all_slots.append(("alu", ("^", v_indices[i] + vi, v_indices[i] + vi, v_indices[i] + vi)))
                             else:
-                                # Bit extraction: use scalar ALU for val & 1
                                 for vi in range(VLEN):
-                                    all_slots.append(("alu", ("&", temps["v_tmp1"] + vi, v_values[i] + vi, scalar_one)))
+                                    all_slots.append(("alu", ("&", temps["v_tmp1"] + vi, v_values[i] + vi, const_1)))
+                                all_slots.append(
+                                    ("valu", ("multiply_add", v_indices[i], v_indices[i], two_v, temps["v_tmp1"]))
+                                )
 
-                        for k, r in prev_group:
-                            if r == rounds - 1:
-                                continue
-                            level = r % (forest_height + 1)
-                            if level == forest_height:
-                                continue
-                            i = i_base + k
-                            temps = batch_temps[k]
-                            all_slots.append(
-                                ("valu", ("multiply_add", v_indices[i], v_indices[i], two_v, temps["v_tmp1"]))
-                            )
                     prev_group = group if group else None
 
-        packed_instrs = self.build_v2(all_slots)
+        packed_instrs = self.build(all_slots)
         self.instrs.extend(packed_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
